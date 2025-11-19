@@ -59,7 +59,7 @@ def initialize(context):
     set_benchmark('000300.XSHG')
     set_option('use_real_price', True)
     g.target = ['000001.XSHE', '600000.XSHG']
-    run_daily(rebalance, time='10:00')
+    run_daily(market_open, time='10:00')
 
 def market_open(context):
     for stock in g.target:
