@@ -29,6 +29,7 @@
 - `handle_data(context, data)`：每个 bar 调用（按回测频率或 Live 调度）；`data` 为行情数据容器。
 - `after_code_changed(context)`：仅 Live 模式，当检测到策略文件内容相较上次运行发生变化且存在历史元数据时触发，用于代码热更新后的修复/迁移逻辑（例如调整全局变量、重新注册任务）。回测不会调用。
 - 其他聚宽钩子（如 `before_trading_start` 以外的扩展）未实现即不会触发。
+- 提示：Live 重启且恢复运行时元数据时，`initialize` 可能不会再跑，需将“每次进程启动都必须执行”的动作（如券商订阅、账号同步）放在 `process_initialize` 或 `after_code_changed` 里以确保执行。
 
 ## 调度与时间表达式
 支持与聚宽一致的定时接口，时间表达式已扩展了常用别名：
@@ -81,6 +82,26 @@
 - `subscribe(security|[...], frequency='tick')`：注册 tick 订阅；支持单个代码或列表，也支持市场全量 `['SH','SZ']`。实盘优先通过引擎/券商订阅；无实盘时尝试本地 `xtdata`（可用则订阅）。限制：仅接受 `frequency='tick'`；模拟模式单策略最多订阅 100 个标的；禁止订阅期货主力/指数合约（如 `RB9999.XSGE`、`IF00.CFFEX`）。
 - `unsubscribe(security|[...], frequency='tick')`、`unsubscribe_all()`：取消订阅。
 - `get_current_tick(security)`：返回最简快照 `{'sid': code, 'last_price': price, 'dt': ts}`，若无数据返回 `None`。
+- Live 提示：订阅列表会持久化，但重启后券商侧不会自动恢复，请在 `process_initialize`（或 `initialize`/`after_code_changed`）里显式调用 `subscribe` 以确保重新订阅。
+- 示例：
+  ```python
+  def initialize(context):
+      # 首次启动或回测中订阅；Live 重启后建议在 process_initialize 再调一次
+      subscribe(['000001.XSHE', '000002.XSHE'], 'tick')
+
+  def process_initialize(context):
+      # Live 场景重启或热更新后，确保券商侧也已订阅
+      subscribe(['000001.XSHE', '000002.XSHE'], 'tick')
+
+  def handle_tick(context, tick):
+      # tick 至少含 sid/last_price/dt；远程推送时可能附带 symbol（QMT 代码）
+      sid = tick.get('sid') or tick.get('symbol')
+      ts = tick.get('dt') or tick.get('time')
+      log.info(
+          f"[TICK] sid={sid} last={tick.get('last_price') or tick.get('lastPrice')} "
+          f"ask1={tick.get('ask1')} bid1={tick.get('bid1')} ts={ts}"
+      )
+  ```
 - 差异提示：只提供最小实现；没有聚宽的 `get_ticks`、盘口十档等高级字段。若策略定义了 `handle_tick(context, tick)`，系统会自动绑定为回调。
 
 ## 数据模型

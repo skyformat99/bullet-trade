@@ -37,6 +37,10 @@
 
 > 轮询模式意味着订阅数量越多，对 server 的请求压力越大；请留意 `tick_subscription_limit`（默认 100）和 `tick_sync_interval`。
 
+### 重启 / 热更新后的订阅要点
+- LiveEngine 会把订阅清单持久化，但券商侧不会自动恢复订阅。若第二次启动时跳过了 `initialize`，订阅不会自动重绑。
+- 建议在 `process_initialize`（Live 独有）或 `after_code_changed` 中再调用一次 `subscribe(...)` 以确保重启/热更新后仍然生效；也可在 `initialize` 里保留调用以兼容回测。
+
 ## 全市场订阅
 - 本地 Windows + xtquant 场景可用：`subscribe(['SH', 'SZ'], 'tick')` 会调用 `xtdata.subscribe_whole_quote`，推送经 `_on_xt_tick` 转发后进入 `handle_tick`。
 - **远程 qmt-remote 暂不支持全市场订阅**：server 端未实现 `allow_full_market` 开关，`RemoteQmtBroker` 也未对接推送订阅；需要全市场时只能在本地 xtdata 运行或自行枚举标的列表。
