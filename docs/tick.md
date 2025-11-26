@@ -64,6 +64,10 @@
    `bullet-trade live strategies/demo.py --broker qmt-remote --env-file .env.live`
 4. 运行中可随时调用 `unsubscribe(['000001.XSHE'], 'tick')` 或 `unsubscribe_all()` 取消。
 
+能从图上看到我们测试环境tick数据的延迟情况
+![delay](assets/tick-delay.png)
+
+
 > 轮询模式意味着订阅数量越多，对 server 的请求压力越大；请留意 `tick_subscription_limit`（默认 100）和 `tick_sync_interval`。
 
 ### 重启 / 热更新后的订阅要点

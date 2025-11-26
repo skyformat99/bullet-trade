@@ -29,6 +29,17 @@
 | `MINIQMT_AUTO_DOWNLOAD` | 否 | `true` | 自动下载 MiniQMT |
 | `QMT_SESSION_ID` | 否 | `0` | 会话 ID，可选 |
 
+## 风控（实盘）
+| 变量 | 必填 | 示例/默认 | 作用 |
+| --- | --- | --- | --- |
+| `MAX_ORDER_VALUE` | 否 | `100000` | 单笔订单金额上限，超出直接拒单。 |
+| `MAX_DAILY_TRADE_VALUE` | 否 | `500000` | 单日累计成交金额上限，超出直接拒单。 |
+| `MAX_DAILY_TRADES` | 否 | `100` | 单日最大交易笔数，超出直接拒单。 |
+| `MAX_STOCK_COUNT` | 否 | `20` | 最大持仓标的数（仅买入检查）。 |
+| `MAX_POSITION_RATIO` | 否 | `20` | 单标下单金额占总资产上限，需要在风控检查时提供账户总资产才会生效。 |
+| `STOP_LOSS_RATIO` | 否 | `5` | 止损阈值，供 `check_stop_loss` 辅助判断，需策略自行下撤单。 |
+| `RISK_CHECK_ENABLED` | 否 | `false` | 后台风控巡检开关，间隔由 `RISK_CHECK_INTERVAL` 控制（默认 `300` 秒）。 |
+
 ## 远程实盘（qmt-remote）
 | 变量 | 必填 | 示例/默认 | 作用 |
 | --- | --- | --- | --- |
