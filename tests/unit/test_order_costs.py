@@ -9,7 +9,7 @@ from bullet_trade.core.globals import reset_globals
 from bullet_trade.core.models import Context, Portfolio, Position
 from bullet_trade.core.orders import order, order_value, clear_order_queue
 from bullet_trade.core.runtime import set_current_engine
-from bullet_trade.core.settings import reset_settings, set_slippage, FixedSlippage
+from bullet_trade.core.settings import reset_settings, set_slippage, FixedSlippage,PriceRelatedSlippage,StepRelatedSlippage
 import importlib
 from bullet_trade.data import api as data_api
 from bullet_trade.data.providers.base import DataProvider
@@ -112,7 +112,8 @@ def _setup_engine(current_dt: datetime) -> BacktestEngine:
     reset_globals()
     reset_settings()
     # 显式设置回默认滑点 0.00246（双边各一半）避免全局污染
-    set_slippage(FixedSlippage(0.00246))
+    #set_slippage(FixedSlippage(0.00246))
+    set_slippage(PriceRelatedSlippage(0.00246))
     clear_order_queue()
 
     engine = BacktestEngine(initial_cash=200000)
@@ -179,7 +180,7 @@ def test_stock_sell_charges_stamp_duty(provider):
     assert trade.tax == pytest.approx(fen(expected_value * 0.001))
     assert trade.commission == pytest.approx(fen(expected_value * 0.0003))
     set_current_engine(None)
-    data_api.set_current_context(None)
+    data_api.set_current_context(None) 
     clear_order_queue()
 
 
@@ -225,3 +226,308 @@ def test_tplus1_rollover_and_same_day_sell_limit(provider):
     set_current_engine(None)
     data_api.set_current_context(None)
     clear_order_queue()
+
+
+# =============================================================================
+# 滑点类型测试：FixedSlippage / PriceRelatedSlippage / StepRelatedSlippage
+# =============================================================================
+
+class TestSlippageTypes:
+    """测试三种滑点类型的买卖双向行为"""
+    
+    def _cleanup(self):
+        """测试清理"""
+        set_current_engine(None)
+        data_api.set_current_context(None)
+        clear_order_queue()
+
+    def test_fixed_slippage_buy(self, provider):
+        """FixedSlippage 买入：价格 + value/2"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 设置固定滑点 0.02 元（双边），单边 0.01 元
+        set_slippage(FixedSlippage(0.02))
+        
+        order("601318.XSHG", 100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 买入价格 = 77.9 + 0.02/2 = 77.91
+        assert trade.price == pytest.approx(77.91)
+        self._cleanup()
+
+    def test_fixed_slippage_sell(self, provider):
+        """FixedSlippage 卖出：价格 - value/2"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="601318.XSHG", total_amount=100, closeable_amount=100, avg_cost=75.0)
+        position.update_price(77.9)
+        engine.context.portfolio.positions["601318.XSHG"] = position
+        # 设置固定滑点 0.02 元（双边），单边 0.01 元
+        set_slippage(FixedSlippage(0.02))
+        
+        order("601318.XSHG", -100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 卖出价格 = 77.9 - 0.02/2 = 77.89
+        assert trade.price == pytest.approx(77.89)
+        self._cleanup()
+
+    def test_price_related_slippage_buy(self, provider):
+        """PriceRelatedSlippage 买入：价格 * (1 + ratio/2)"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 设置比例滑点 1%（双边），单边 0.5%
+        set_slippage(PriceRelatedSlippage(0.01))
+        
+        order("601318.XSHG", 100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 买入价格 = 77.9 * (1 + 0.01/2) = 77.9 * 1.005 = 78.2895 ≈ 78.29
+        expected_price = 77.9 * (1 + 0.01 / 2)
+        import decimal
+        expected_price = float(decimal.Decimal(str(expected_price)).quantize(
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+        assert trade.price == pytest.approx(expected_price)
+        self._cleanup()
+
+    def test_price_related_slippage_sell(self, provider):
+        """PriceRelatedSlippage 卖出：价格 * (1 - ratio/2)"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="601318.XSHG", total_amount=100, closeable_amount=100, avg_cost=75.0)
+        position.update_price(77.9)
+        engine.context.portfolio.positions["601318.XSHG"] = position
+        # 设置比例滑点 1%（双边），单边 0.5%
+        set_slippage(PriceRelatedSlippage(0.01))
+        
+        order("601318.XSHG", -100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 卖出价格 = 77.9 * (1 - 0.01/2) = 77.9 * 0.995 = 77.5105 ≈ 77.51
+        expected_price = 77.9 * (1 - 0.01 / 2)
+        import decimal
+        expected_price = float(decimal.Decimal(str(expected_price)).quantize(
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+        assert trade.price == pytest.approx(expected_price)
+        self._cleanup()
+
+    def test_step_related_slippage_buy(self, provider):
+        """StepRelatedSlippage 买入：价格 + steps * tick / 2"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 设置跳数滑点 4 跳（双边），单边 2 跳，股票 tick=0.01
+        set_slippage(StepRelatedSlippage(4))
+        
+        order("601318.XSHG", 100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 买入价格 = 77.9 + 4 * 0.01 / 2 = 77.9 + 0.02 = 77.92
+        assert trade.price == pytest.approx(77.92)
+        self._cleanup()
+
+    def test_step_related_slippage_sell(self, provider):
+        """StepRelatedSlippage 卖出：价格 - steps * tick / 2"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="601318.XSHG", total_amount=100, closeable_amount=100, avg_cost=75.0)
+        position.update_price(77.9)
+        engine.context.portfolio.positions["601318.XSHG"] = position
+        # 设置跳数滑点 4 跳（双边），单边 2 跳，股票 tick=0.01
+        set_slippage(StepRelatedSlippage(4))
+        
+        order("601318.XSHG", -100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 卖出价格 = 77.9 - 4 * 0.01 / 2 = 77.9 - 0.02 = 77.88
+        assert trade.price == pytest.approx(77.88)
+        self._cleanup()
+
+
+# =============================================================================
+# 费用测试：按品种区分（股票/ETF/MMF）× 买卖方向
+# =============================================================================
+
+class TestOrderCostsBySecurityType:
+    """测试不同品种的费用规则"""
+    
+    def _cleanup(self):
+        """测试清理"""
+        set_current_engine(None)
+        data_api.set_current_context(None)
+        clear_order_queue()
+
+    def _fen(self, x):
+        """四舍五入到分"""
+        import decimal
+        return float(decimal.Decimal(str(x)).quantize(
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+
+    # --------------- 股票 ---------------
+    def test_stock_buy_commission_no_stamp_duty(self, provider):
+        """股票买入：有佣金（万三，最低5元），无印花税"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 不设置滑点，使用默认 PriceRelatedSlippage(0.00246)
+        
+        order("601318.XSHG", 100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 买入价格 = 77.9 * (1 + 0.00246/2)
+        expected_price = 77.9 * (1 + 0.00246 / 2)
+        expected_price = self._fen(expected_price)
+        expected_value = expected_price * 100
+        
+        # 印花税 = 0（买入无印花税）
+        assert trade.tax == pytest.approx(0.0)
+        # 佣金 = max(expected_value * 0.0003, 5.0)
+        expected_commission = max(self._fen(expected_value * 0.0003), 5.0)
+        assert trade.commission == pytest.approx(expected_commission)
+        self._cleanup()
+
+    def test_stock_sell_commission_and_stamp_duty(self, provider):
+        """股票卖出：有佣金（万三，最低5元）+ 印花税（千一）"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="601318.XSHG", total_amount=100, closeable_amount=100, avg_cost=75.0)
+        position.update_price(77.9)
+        engine.context.portfolio.positions["601318.XSHG"] = position
+        
+        order("601318.XSHG", -100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        # 卖出价格 = 77.9 * (1 - 0.00246/2)
+        expected_price = 77.9 * (1 - 0.00246 / 2)
+        expected_price = self._fen(expected_price)
+        expected_value = expected_price * 100
+        
+        # 印花税 = expected_value * 0.001
+        assert trade.tax == pytest.approx(self._fen(expected_value * 0.001))
+        # 佣金 = max(expected_value * 0.0003, 5.0)
+        expected_commission = max(self._fen(expected_value * 0.0003), 5.0)
+        assert trade.commission == pytest.approx(expected_commission)
+        self._cleanup()
+
+    # --------------- ETF ---------------
+    def test_etf_buy_commission_no_stamp_duty(self, provider):
+        """ETF 买入：有佣金（万三，最低5元），无印花税"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        
+        order("159949.XSHE", 1000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # 印花税 = 0
+        assert trade.tax == pytest.approx(0.0)
+        # 佣金最低 5 元
+        assert trade.commission >= 5.0
+        self._cleanup()
+
+    def test_etf_sell_commission_no_stamp_duty(self, provider):
+        """ETF 卖出：有佣金（万三，最低5元），无印花税"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="159949.XSHE", total_amount=1000, closeable_amount=1000, avg_cost=1.20)
+        position.update_price(1.2345)
+        engine.context.portfolio.positions["159949.XSHE"] = position
+        
+        order("159949.XSHE", -1000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # 印花税 = 0
+        assert trade.tax == pytest.approx(0.0)
+        # 佣金最低 5 元
+        assert trade.commission >= 5.0
+        self._cleanup()
+
+    # --------------- 货币基金 MMF ---------------
+    def test_mmf_buy_no_cost(self, provider):
+        """MMF 买入：无佣金，无印花税"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        
+        order_value("511880.XSHG", 10000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        assert trade.tax == pytest.approx(0.0)
+        assert trade.commission == pytest.approx(0.0)
+        self._cleanup()
+
+    def test_mmf_sell_no_cost(self, provider):
+        """MMF 卖出：无佣金，无印花税"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        position = Position(security="511880.XSHG", total_amount=10000, closeable_amount=10000, avg_cost=1.00)
+        position.update_price(1.00215)
+        engine.context.portfolio.positions["511880.XSHG"] = position
+        
+        order("511880.XSHG", -10000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        assert trade.tax == pytest.approx(0.0)
+        assert trade.commission == pytest.approx(0.0)
+        self._cleanup()
+
+
+# =============================================================================
+# 默认行为测试
+# =============================================================================
+
+class TestDefaultSlippageBehavior:
+    """测试默认滑点行为"""
+    
+    def _cleanup(self):
+        """测试清理"""
+        set_current_engine(None)
+        data_api.set_current_context(None)
+        clear_order_queue()
+
+    def test_default_slippage_is_price_related_0246bps(self, provider):
+        """验证默认滑点是 PriceRelatedSlippage(0.00246)，即 24.6bps"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 不调用 set_slippage，使用默认值（_setup_engine 已设置为聚宽默认）
+        
+        order("601318.XSHG", 100)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # 默认比例滑点 24.6bps，买入价格 = 77.9 * (1 + 0.00246/2)
+        expected_price = 77.9 * (1 + 0.00246 / 2)
+        import decimal
+        expected_price = float(decimal.Decimal(str(expected_price)).quantize(
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP))
+        assert trade.price == pytest.approx(expected_price)
+        self._cleanup()
+
+    def test_mmf_default_slippage_is_zero(self, provider):
+        """验证 MMF 默认滑点为 0"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 不调用 set_slippage，MMF 应忽略任何滑点
+        
+        order_value("511880.XSHG", 10000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # MMF 价格应等于行情价（按 0.001 精度取整）
+        # 行情价 1.00215，按 0.001 四舍五入 = 1.002
+        assert trade.price == pytest.approx(1.002)
+        self._cleanup()
+
+    def test_mmf_ignores_price_related_slippage(self, provider):
+        """验证 MMF 忽略显式设置的 PriceRelatedSlippage"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 显式设置较大的比例滑点 10%
+        set_slippage(PriceRelatedSlippage(0.1))
+        
+        order_value("511880.XSHG", 10000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # MMF 应忽略滑点，价格仍为行情价
+        assert trade.price == pytest.approx(1.002)
+        self._cleanup()
+
+    def test_mmf_ignores_step_related_slippage(self, provider):
+        """验证 MMF 忽略显式设置的 StepRelatedSlippage"""
+        engine = _setup_engine(datetime(2021, 1, 5, 9, 31))
+        # 显式设置较大的跳数滑点
+        set_slippage(StepRelatedSlippage(100))
+        
+        order_value("511880.XSHG", 10000)
+        assert engine.trades, "trade should be recorded"
+        trade = engine.trades[-1]
+        
+        # MMF 应忽略滑点，价格仍为行情价
+        assert trade.price == pytest.approx(1.002)
+        self._cleanup()

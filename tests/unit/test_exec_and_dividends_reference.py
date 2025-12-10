@@ -101,6 +101,7 @@ class ReferenceProvider(DataProvider):
             "511880.XSHG": {
                 "2024-07-10": {"open": 100.973, "close": 101.000},
                 "2024-12-31": {"open": 100.093, "close": 100.093},
+                "2025-01-10": {"open": 100.111, "close": 100.111},
             },
             "601318.XSHG": {
                 "2024-07-10": {"open": 41.120, "close": 41.120},
@@ -113,9 +114,7 @@ class ReferenceProvider(DataProvider):
         }
         # 分钟close（未复权）
         self.minute: Dict[str, Dict[str, float]] = {
-            # 2025-01-10 09:30 成交基准
-            ("601318.XSHG", "2025-01-10 09:30"): 49.760,
-            ("511880.XSHG", "2025-01-10 09:30"): 100.111,
+            # 保留接口占位，参考用例默认不提供 09:30 分钟线，按日开回退
         }
 
         # 现金分红事件（标准化结构）
@@ -171,6 +170,21 @@ class ReferenceProvider(DataProvider):
         # 简化：仅支持单标的，按 end_date 返回最后一条
         sec = security if isinstance(security, str) else security[0]
         ts = pd.to_datetime(end_date) if end_date is not None else pd.Timestamp("2024-07-10 09:30")
+        fields_set = set(fields or [])
+        # 停牌检测会请求 volume/paused：需要覆盖 start-end 区间内的每一天，且 volume>0/paused=0 才不会被判停牌
+        if frequency == "daily" and ({"volume", "paused"} & fields_set):
+            sd = pd.to_datetime(start_date).date() if start_date is not None else ts.date()
+            ed = pd.to_datetime(end_date).date() if end_date is not None else ts.date()
+            days = pd.date_range(sd, ed, freq="D")
+            rows = []
+            for d in days:
+                key = d.date().isoformat()
+                base = dict(self.daily.get(sec, {}).get(key, {"open": 1.0, "close": 1.0}))
+                base.setdefault("volume", 1.0)
+                base.setdefault("paused", 0)
+                rows.append(base)
+            df = pd.DataFrame(rows, index=[pd.Timestamp(d.date()) for d in days])
+            return df
         date_key = ts.date().isoformat()
         if frequency == "daily":
             data = dict(self.daily.get(sec, {}).get(date_key, {}))
@@ -194,7 +208,7 @@ class ReferenceProvider(DataProvider):
             minute_key = f"{ts.strftime('%Y-%m-%d %H:%M')}"
             val = self.minute.get((sec, minute_key), None)
             if val is None:
-                val = 1.0
+                return pd.DataFrame()
             df = pd.DataFrame([{"close": float(val)}], index=[pd.Timestamp(ts)])
             return df
 
@@ -326,8 +340,8 @@ def test_reference_trades_match_prices_and_fees():
         _assert_trade(trades[1], "601318.XSHG", 1200, 41.120, 14.80)
         # 第三笔：511880 卖出 -300，100.111，手续费 0
         _assert_trade(trades[2], "511880.XSHG", -300, 100.111, 0.0)
-        # 第四笔：601318 卖出 -1100，49.760，手续费 71.16（按 0.0013）
-        _assert_trade(trades[3], "601318.XSHG", -1100, 49.760, 71.16)
+        # 第四笔：601318 卖出 -1100，按日开 48.820，手续费 69.81（按 0.0013）
+        _assert_trade(trades[3], "601318.XSHG", -1100, 48.820, 69.81)
     finally:
         data_api.reset_security_overrides()
 

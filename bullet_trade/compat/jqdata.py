@@ -41,14 +41,14 @@ __all__ = [
     # 订单相关
     'order', 'order_target', 'order_value', 'order_target_value', 'cancel_order', 'cancel_all_orders',
     'MarketOrderStyle', 'LimitOrderStyle',
-    'FixedSlippage',
-    'OrderCost',
+    'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
+    'OrderCost', 'PerTrade',
     
     # 调度器
     'run_daily', 'run_weekly', 'run_monthly', 'unschedule_all',
     
     # 设置相关
-    'set_benchmark', 'set_option', 'set_slippage', 'set_order_cost',
+    'set_benchmark', 'set_option', 'set_slippage', 'set_order_cost', 'set_commission', 'set_universe',
     
     # 数据API
     'get_price', 'attribute_history',

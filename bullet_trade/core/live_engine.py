@@ -55,6 +55,8 @@ from .settings import (
     set_slippage,
     OrderCost,
     FixedSlippage,
+    PriceRelatedSlippage,
+    StepRelatedSlippage,
 )
 from ..data.api import get_current_data, set_current_context, get_security_info, get_data_provider
 from ..utils.env_loader import (
@@ -679,7 +681,12 @@ class LiveEngine:
 
         exec_price: Optional[float] = None
         style_obj = getattr(order, "style", None)
-        is_market = not isinstance(style_obj, LimitOrderStyle)
+        if isinstance(style_obj, LimitOrderStyle):
+            is_market = False
+        elif isinstance(style_obj, MarketOrderStyle):
+            is_market = style_obj.limit_price is None
+        else:
+            is_market = True
         if isinstance(style_obj, LimitOrderStyle):
             exec_price = float(style_obj.price)
         elif isinstance(style_obj, MarketOrderStyle) and style_obj.limit_price is not None:
@@ -1184,6 +1191,7 @@ class LiveEngine:
             options['market_period'] = self._serialize_market_periods(options['market_period'])
         snapshot['options'] = options
         order_cost_snapshot: Dict[str, Dict[str, Any]] = {}
+        order_cost_override_snapshot: Dict[str, Dict[str, Any]] = {}
         for asset, cost in (settings.order_cost or {}).items():
             order_cost_snapshot[str(asset)] = {
                 'open_tax': cost.open_tax,
@@ -1192,14 +1200,70 @@ class LiveEngine:
                 'close_commission': cost.close_commission,
                 'min_commission': cost.min_commission,
                 'close_today_commission': cost.close_today_commission,
+                'commission_type': getattr(cost, 'commission_type', 'by_money'),
             }
         snapshot['order_cost'] = order_cost_snapshot
-        if settings.slippage:
-            snapshot['slippage'] = {
-                'class': settings.slippage.__class__.__name__,
-                'value': getattr(settings.slippage, 'value', None),
+        for asset, cost in (getattr(settings, 'order_cost_overrides', {}) or {}).items():
+            order_cost_override_snapshot[str(asset)] = {
+                'open_tax': cost.open_tax,
+                'close_tax': cost.close_tax,
+                'open_commission': cost.open_commission,
+                'close_commission': cost.close_commission,
+                'min_commission': cost.min_commission,
+                'close_today_commission': cost.close_today_commission,
+                'commission_type': getattr(cost, 'commission_type', 'by_money'),
             }
+        if order_cost_override_snapshot:
+            snapshot['order_cost_overrides'] = order_cost_override_snapshot
+        if settings.slippage:
+            payload = {'class': settings.slippage.__class__.__name__}
+            if hasattr(settings.slippage, 'value'):
+                payload['value'] = getattr(settings.slippage, 'value', None)
+            if hasattr(settings.slippage, 'ratio'):
+                payload['ratio'] = getattr(settings.slippage, 'ratio', None)
+            if hasattr(settings.slippage, 'steps'):
+                payload['steps'] = getattr(settings.slippage, 'steps', None)
+            snapshot['slippage'] = payload
+        sl_map = getattr(settings, 'slippage_map', {}) or {}
+        sl_map_snapshot: Dict[str, Any] = {}
+        for key, cfg in sl_map.items():
+            payload = self._serialize_slippage_config(cfg)
+            if payload is not None:
+                sl_map_snapshot[key] = payload
+        if sl_map_snapshot:
+            snapshot['slippage_map'] = sl_map_snapshot
         return snapshot
+
+    @staticmethod
+    def _serialize_slippage_config(config: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(config, PriceRelatedSlippage):
+            return {'class': 'PriceRelatedSlippage', 'ratio': float(config.ratio)}
+        if isinstance(config, StepRelatedSlippage):
+            return {'class': 'StepRelatedSlippage', 'steps': int(config.steps)}
+        if isinstance(config, FixedSlippage):
+            return {'class': 'FixedSlippage', 'value': float(config.value)}
+        if hasattr(config, 'to_dict'):
+            try:
+                return {'class': config.__class__.__name__, **config.to_dict()}
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _deserialize_slippage_config(payload: Dict[str, Any]) -> Optional[Any]:
+        if not isinstance(payload, dict):
+            return None
+        cls = payload.get('class')
+        try:
+            if cls == 'PriceRelatedSlippage':
+                return PriceRelatedSlippage(payload.get('ratio', 0.0))
+            if cls == 'StepRelatedSlippage':
+                return StepRelatedSlippage(payload.get('steps', 0))
+            if cls == 'FixedSlippage':
+                return FixedSlippage(payload.get('value', 0.0))
+        except Exception:
+            return None
+        return None
 
     def _collect_scheduler_tasks_snapshot(self) -> List[Dict[str, Any]]:
         tasks_meta: List[Dict[str, Any]] = []
@@ -1269,10 +1333,39 @@ class LiveEngine:
                 set_order_cost(cost, type=asset)
             except Exception as exc:
                 log.debug(f"恢复 order_cost({asset}) 失败: {exc}")
-        slippage = snapshot.get('slippage')
-        if slippage and slippage.get('class') == 'FixedSlippage':
+        order_cost_overrides = snapshot.get('order_cost_overrides') or {}
+        for asset, payload in order_cost_overrides.items():
             try:
-                set_slippage(FixedSlippage(slippage.get('value', 0.0)))
+                cost = OrderCost(**payload)
+                # asset 形如 type_code
+                if '_' in asset:
+                    type_prefix, ref_code = asset.split('_', 1)
+                    set_order_cost(cost, type=type_prefix, ref=ref_code)
+            except Exception as exc:
+                log.debug(f"恢复 order_cost_overrides({asset}) 失败: {exc}")
+        sl_map = snapshot.get('slippage_map') or {}
+        if sl_map:
+            try:
+                settings = get_settings()
+                settings.slippage_map = {}
+                for key, payload in sl_map.items():
+                    cfg = self._deserialize_slippage_config(payload)
+                    if cfg:
+                        settings.slippage_map[key] = cfg
+                if settings.slippage is None and 'all' in settings.slippage_map:
+                    settings.slippage = settings.slippage_map.get('all')
+            except Exception as exc:
+                log.debug(f"恢复 slippage_map 失败: {exc}")
+        slippage = snapshot.get('slippage')
+        if slippage:
+            cls = slippage.get('class')
+            try:
+                if cls == 'FixedSlippage':
+                    set_slippage(FixedSlippage(slippage.get('value', 0.0)))
+                elif cls == 'PriceRelatedSlippage':
+                    set_slippage(PriceRelatedSlippage(slippage.get('ratio', 0.0)))
+                elif cls == 'StepRelatedSlippage':
+                    set_slippage(StepRelatedSlippage(slippage.get('steps', 0)))
             except Exception as exc:
                 log.debug(f"恢复 slippage 失败: {exc}")
 

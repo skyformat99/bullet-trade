@@ -12,8 +12,8 @@ from .models import (
 from .globals import g, log
 from .notifications import send_msg, set_message_handler
 from .settings import (
-    set_benchmark, set_order_cost, set_slippage,
-    set_option, OrderCost, FixedSlippage
+    set_benchmark, set_order_cost, set_commission, set_universe, set_slippage,
+    set_option, OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 )
 from .orders import (
     order, order_value, order_target, order_target_value
@@ -41,8 +41,8 @@ __all__ = [
     # 全局对象
     'g', 'log', 'send_msg', 'set_message_handler',
     # 设置函数
-    'set_benchmark', 'set_order_cost', 'set_slippage',
-    'set_option', 'OrderCost', 'FixedSlippage',
+    'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage',
+    'set_option', 'OrderCost', 'PerTrade', 'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     # 订单函数
     'order', 'order_value', 'order_target', 'order_target_value',
     # 调度函数
@@ -53,4 +53,3 @@ __all__ = [
     'RiskController', 'RiskStats',
     'get_global_risk_controller', 'reset_global_risk_controller',
 ]
-

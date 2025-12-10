@@ -7,6 +7,7 @@
 import importlib.util
 import inspect as _inspect
 import sys
+import re
 from typing import Dict, Any, Callable, Optional, List, Sequence, Tuple
 from datetime import datetime, timedelta, time as Time
 import pandas as pd
@@ -22,7 +23,7 @@ jq = None
 
 from .models import Context, Portfolio, Position, Trade, OrderStatus
 from .globals import g, log, reset_globals
-from .settings import get_settings, reset_settings, OrderCost
+from .settings import get_settings, reset_settings, OrderCost, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 from .orders import get_order_queue, clear_order_queue, MarketOrderStyle, LimitOrderStyle
 from .scheduler import (
     generate_daily_schedule,
@@ -187,8 +188,8 @@ class BacktestEngine:
         """向策略模块注入全局变量和函数"""
         from .globals import g, log
         from .settings import (
-            set_benchmark, set_order_cost, set_slippage, set_option,
-            OrderCost, FixedSlippage
+            set_benchmark, set_order_cost, set_commission, set_universe, set_slippage, set_option,
+            OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
         )
         from .api import (
             subscribe as _subscribe,
@@ -235,10 +236,15 @@ class BacktestEngine:
         # 注入设置函数
         module.set_benchmark = set_benchmark
         module.set_order_cost = set_order_cost
+        module.set_commission = set_commission
+        module.set_universe = set_universe
         module.set_slippage = set_slippage
         module.set_option = set_option
         module.OrderCost = OrderCost
+        module.PerTrade = PerTrade
         module.FixedSlippage = FixedSlippage
+        module.PriceRelatedSlippage = PriceRelatedSlippage
+        module.StepRelatedSlippage = StepRelatedSlippage
         # 研究文件读写
         module.read_file = _read_file
         module.write_file = _write_file
@@ -870,7 +876,12 @@ class BacktestEngine:
         info = get_security_info(security)
         category = self._infer_security_category(security, info)
         settings = get_settings()
-        order_cost = settings.order_cost.get(category)
+        type_hint = str(info.get('type') or category).lower()
+        order_cost = settings.order_cost_overrides.get(f"{category}_{security}")
+        if not order_cost:
+            order_cost = settings.order_cost_overrides.get(f"{type_hint}_{security}")
+        if not order_cost:
+            order_cost = settings.order_cost.get(category)
         if not order_cost and category != 'stock':
             order_cost = settings.order_cost.get('stock')
         if not order_cost:
@@ -893,7 +904,7 @@ class BacktestEngine:
         # get_security_info 已合并 security_overrides.json 的配置（by_code > by_prefix）
         # 所以 info.get('category') 已经是最终结果
         explicit = str(info.get('category') or '').lower()
-        if explicit in ('money_market_fund', 'fund', 'stock'):
+        if explicit in ('money_market_fund', 'fund', 'stock', 'futures'):
             return explicit
 
         # 兼容数据源返回的 type/subtype 字段
@@ -905,16 +916,20 @@ class BacktestEngine:
         if primary in ('fund', 'etf'):
             # jqdatasdk 返回 type='etf'，统一归类为 fund
             return 'fund'
+        if primary == 'futures':
+            return 'futures'
         if primary == 'stock':
             return 'stock'
 
         # 默认视为股票（security_overrides.json 的 by_prefix 已在 get_security_info 中处理）
         return 'stock'
 
-    def _calc_trade_price_with_default_slippage(self, price: float, is_buy: bool, security: str) -> float:
+    def _calc_trade_price_with_default_slippage(self, price: float, is_buy: bool, security: str, info: Optional[Dict[str, Any]] = None, category: Optional[str] = None) -> float:
         """未显式配置滑点时，按品类采用默认值；现金类不应用滑点。"""
-        info = get_security_info(security)
-        category = self._infer_security_category(security, info)
+        if info is None:
+            info = get_security_info(security)
+        if category is None:
+            category = self._infer_security_category(security, info)
         # 可由 overrides 指定精确值
         ratio = info.get('slippage')
         if not isinstance(ratio, (int, float)):
@@ -926,6 +941,90 @@ class BacktestEngine:
             return price
         half = float(ratio) / 2.0
         return price * (1 + half) if is_buy else price * (1 - half)
+
+    def _select_slippage_config(self, security: str, category: str, info: Dict[str, Any]) -> Optional[Any]:
+        """按聚宽语义解析滑点配置优先级。"""
+        settings = get_settings()
+        sl_map = getattr(settings, 'slippage_map', {}) or {}
+        if not sl_map:
+            return None
+        keys = []
+        code = security
+        type_hint = str(info.get('type') or '').lower()
+        subtype = str(info.get('subtype') or '').lower()
+
+        if category == 'stock':
+            keys.append(f'stock_{code}')
+            keys.append('stock')
+        elif category == 'fund' or subtype in ('fund', 'index'):
+            keys.append(f'fund_{code}')
+            keys.append('fund')
+        elif category == 'money_market_fund' or subtype in ('mmf', 'money_market_fund'):
+            return None
+
+        if type_hint == 'index' and category != 'stock':
+            keys.append(f'fund_{code}')
+            keys.append('fund')
+
+        if type_hint == 'futures' or category == 'futures':
+            keys.append(f'futures_{code}')
+            try:
+                tag = re.sub(r'\\d+.*', '', code.split('.')[0])
+                if tag:
+                    keys.append(f'futures_{tag}')
+            except Exception:
+                pass
+            keys.append('futures')
+
+        keys.append(code)
+        keys.append(category)
+        keys.append('all')
+
+        seen = set()
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            cfg = sl_map.get(key)
+            if cfg is not None:
+                return cfg
+        return None
+
+    def _apply_slippage_config(self, config: Any, price: float, is_buy: bool, security: str, category: str, info: Dict[str, Any]) -> float:
+        """根据配置计算滑点后的价格。"""
+        try:
+            if isinstance(config, PriceRelatedSlippage):
+                half = float(config.ratio) / 2.0
+                return price * (1 + half) if is_buy else price * (1 - half)
+            if isinstance(config, StepRelatedSlippage):
+                tick = self._tick_step_for_security(security, info=info, category=category)
+                half = float(config.steps) * tick / 2.0
+                return price + half if is_buy else price - half
+            if isinstance(config, FixedSlippage):
+                half = float(config.value) / 2.0
+                return price + half if is_buy else price - half
+            # 兜底：若实现了 calculate_slippage 接口
+            if hasattr(config, 'calculate_slippage'):
+                return config.calculate_slippage(price, is_buy)
+        except Exception as exc:
+            log.debug(f"应用滑点失败 {security}: {exc}")
+        return price
+
+    def _apply_slippage_price(self, price: float, is_buy: bool, security: str) -> float:
+        """统一处理滑点选择与回退。"""
+        info = get_security_info(security)
+        category = self._infer_security_category(security, info)
+        subtype = str(info.get('subtype') or '').lower()
+        if category == 'money_market_fund' or subtype in ('mmf', 'money_market_fund'):
+            return price
+
+        settings = get_settings()
+        cfg = self._select_slippage_config(security, category, info)
+        if cfg:
+            return self._apply_slippage_config(cfg, price, is_buy, security, category, info)
+        if settings.slippage:
+            return self._apply_slippage_config(settings.slippage, price, is_buy, security, category, info)
+        return self._calc_trade_price_with_default_slippage(price, is_buy, security, info=info, category=category)
 
     @staticmethod
     def _round_half_up(value: float, decimals: int) -> float:
@@ -952,10 +1051,21 @@ class BacktestEngine:
             ticks_rounded = math.floor(ticks + 0.5)
         return round(ticks_rounded * step, 3 if step == 0.001 else 2)
 
-    def _tick_step_for_security(self, security: str) -> float:
+    def _tick_step_for_security(self, security: str, info: Optional[Dict[str, Any]] = None, category: Optional[str] = None) -> float:
         """返回标的对应的最小报价步长。"""
-        info = get_security_info(security)
-        category = self._infer_security_category(security, info)
+        if info is None:
+            info = get_security_info(security)
+        if category is None:
+            category = self._infer_security_category(security, info)
+        tick_decimals = info.get('tick_decimals')
+        tick_size = info.get('tick_size')
+        try:
+            if isinstance(tick_size, (int, float)) and tick_size > 0:
+                return float(tick_size)
+            if isinstance(tick_decimals, (int, float)) and tick_decimals >= 0:
+                return float(round(10 ** (-int(tick_decimals)), 6))
+        except Exception:
+            pass
         return 0.01 if category == 'stock' else 0.001
 
     def _rollover_tplus_for_new_day(self) -> None:
@@ -1139,6 +1249,27 @@ class BacktestEngine:
         try:
             t = current_dt.time() if isinstance(current_dt, datetime) else None
             if t and (Time(9, 25) <= t < Time(9, 31)):
+                # # 优先尝试 09:30 分钟价（若存在），否则回退到日开
+                # try:
+                #     dfm = api_get_price(
+                #         security=security,
+                #         end_date=current_dt,
+                #         frequency='minute',
+                #         fields=['close'],
+                #         count=1,
+                #         fq=fq_mode
+                #     )
+                #     if not dfm.empty:
+                #         rowm = dfm.iloc[-1]
+                #         if isinstance(dfm.index, pd.DatetimeIndex):
+                #             last_ts = dfm.index[-1]
+                #             # 若最后一行时间早于当前时间，仍可作为近似基准
+                #             if last_ts <= pd.Timestamp(current_dt):
+                #                 val = float(rowm.get('close') or 0.0)
+                #                 if val > 0:
+                #                     return val
+                # except Exception:
+                #     pass
                 dfp = api_get_price(
                     security=security,
                     end_date=current_dt,
@@ -1389,10 +1520,7 @@ class BacktestEngine:
                     if category == 'money_market_fund':
                         trade_price = current_price
                     else:
-                        if settings.slippage:
-                            trade_price = settings.slippage.calculate_slippage(current_price, is_buy)
-                        else:
-                            trade_price = self._calc_trade_price_with_default_slippage(current_price, is_buy, order.security)
+                        trade_price = self._apply_slippage_price(current_price, is_buy, order.security)
 
                 trade_price = self._round_to_tick(trade_price, order.security, is_buy=None)
                 

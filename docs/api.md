@@ -49,8 +49,10 @@
   - `order_match_mode`：撮合时机，`'immediate'`（默认，创建订单即处理）或 `'bar_end'`（等到 bar 结束统一撮合）。
   - `match_by_signal`：限价单资金检查使用信号价(`True`)或撮合价(`False`，默认)。
   - `market_period` / `time_aliases`：可传入自定义交易时段或别名列表，影响调度时间解析。
-- `set_slippage(FixedSlippage(value))`：设置固定滑点；内部按双边一半计算（value=0.002 -> 买入+0.001，卖出-0.001）。
-- `set_order_cost(OrderCost(...), type='stock')`：设置手续费/印花税，按资产类别覆盖。默认 `stock` 买入佣金万三、卖出佣金万三+千分之一印花税、最小佣金 5 元；`fund/money_market_fund` 默认免印花税。
+- `set_slippage(...)`：聚宽兼容滑点，支持 `FixedSlippage(绝对价差)` / `PriceRelatedSlippage(比例)` / `StepRelatedSlippage(跳数)`，可按 `type/ref` 写入全局/品类/合约；撮合按单边一半计算（买入 +，卖出 -），跳数按标的 tick 步长；货币基金强制 0 滑点；未显式配置时回退到 `security_overrides` 或默认 0.00246（价格相关）。
+- `set_order_cost(OrderCost(...), type='stock', ref=None)`：设置手续费/印花税，支持代码级覆盖。默认 `stock` 买入佣金万三、卖出佣金万三+千分之一印花税、最小佣金 5 元；`fund/money_market_fund` 默认免印花税。
+- `set_commission(PerTrade(...))`：聚宽兼容的股票费用设置（开平费率+最小佣金，印花税 0），等价于股票的 `set_order_cost`。
+- `set_universe(stocks)`：聚宽兼容，记录策略标的池（元组）。
 - `set_data_provider(name|instance, **kwargs)` / `get_data_provider()`：切换或读取当前数据源。内置名称：`jqdata`（默认）、`tushare`、`qmt`/`miniqmt`、`qmt-remote`。切换后自动重新认证并清空缓存。
 
 ## 数据接口 {#data-api}
@@ -79,7 +81,7 @@
   - `cancel_all_orders()`：撤销本地队列所有订单。  
   - 默认 `set_option('order_match_mode', 'immediate')` 时创建即撮合；否则在 bar 结束批量撮合。
 - 价格样式：`MarketOrderStyle(limit_price=None, buy_price_percent=None, sell_price_percent=None)`（市价，可选保护价或价差系数，实盘会带保护价并传 `market=True`）；`LimitOrderStyle(price)`（限价）。
-- 回测撮合：无论市价/限价，成交价默认按滑点计算（显式 `set_slippage` > 默认 0.00246/2 双边）；保护价/限价仅用于资金检查和接受条件，不直接决定成交价。
+- 回测撮合：无论市价/限价，成交价按滑点优先级应用（`ref` > `type` > `all` > 旧全局设置 > `security_overrides`/默认 0.00246/2）；保护价/限价仅用于资金检查和接受条件，不直接决定成交价；货币基金强制 0 滑点。
 - 成本/滑点：`OrderCost`、`FixedSlippage` 同上。
 
 <a id="tick-subscription"></a>

@@ -12,8 +12,8 @@ from .runtime import get_current_engine
 
 # 导入设置函数
 from .settings import (
-    set_benchmark, set_order_cost, set_slippage, set_option,
-    OrderCost, FixedSlippage
+    set_benchmark, set_order_cost, set_commission, set_universe, set_slippage, set_option,
+    OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 )
 
 # 导入订单函数
@@ -440,8 +440,8 @@ __all__ = [
     'g', 'log', 'send_msg', 'set_message_handler',
     
     # 设置函数
-    'set_benchmark', 'set_order_cost', 'set_slippage', 'set_option',
-    'OrderCost', 'FixedSlippage',
+    'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
+    'OrderCost', 'PerTrade', 'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     
     # 订单函数
     'order', 'order_value', 'order_target', 'order_target_value', 'cancel_order', 'cancel_all_orders',
@@ -461,6 +461,7 @@ __all__ = [
     'get_index_stocks',
     'get_split_dividend',
     'set_data_provider', 'get_data_provider',
+    'read_file', 'write_file',
     # Tick 订阅占位
     'subscribe', 'unsubscribe', 'unsubscribe_all', 'get_current_tick',
 ]

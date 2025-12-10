@@ -113,6 +113,8 @@ class TestJQDataProviderAuth:
 
         monkeypatch.setenv('JQDATA_USERNAME', 'host_user')
         monkeypatch.setenv('JQDATA_PASSWORD', 'host_pwd')
+        monkeypatch.setenv('JQDATA_SERVER', '')  # 清空，或设置带注释的测试值
+        monkeypatch.setenv('JQDATA_PORT', '')    # 清空
 
         provider.auth()
 
