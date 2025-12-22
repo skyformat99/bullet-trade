@@ -78,7 +78,17 @@ class RemoteQmtBroker(BrokerBase):
     async def cancel_order(self, order_id: str) -> bool:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, self._cancel_sync, order_id)
-        return bool(result.get("value") or result.get("success", True))
+        value = result.get("value") if isinstance(result, dict) else None
+        if isinstance(value, bool):
+            ok = value
+        elif value is None:
+            ok = bool(result.get("success", True)) if isinstance(result, dict) else True
+        else:
+            ok = bool(value)
+        if isinstance(result, dict) and result.get("timed_out"):
+            status = result.get("status") or result.get("raw_status") or "unknown"
+            log.warning(f"撤单等待超时: order_id={order_id}, status={status}")
+        return ok
 
     async def get_order_status(self, order_id: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()

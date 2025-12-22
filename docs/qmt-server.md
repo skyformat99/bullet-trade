@@ -125,3 +125,4 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 - 鉴权失败：token 不一致；必要时加 `--allowlist` 或 TLS。
 - 行情缺失：确认 QMT 已登录且有行情权限。
 - 多账户：`--accounts a=123456:stock,b=654321:stock`，客户端 `QMT_SERVER_ACCOUNT_KEY=a` 选择账户。
+- 撤单等待：broker.cancel_order 默认按 TRADE_MAX_WAIT_TIME 轮询订单状态，返回 timed_out=true 表示仍未进入终态，可再调用 broker.order_status 确认

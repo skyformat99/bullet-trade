@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -235,8 +236,46 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         if not order_id:
             raise ValueError("缺少 order_id")
         broker = self._broker_for(account)
-        result = await broker.cancel_order(order_id)
-        return {"dtype": "dict", "value": result or {}}
+        ok = await broker.cancel_order(order_id)
+        response: Dict[str, Any] = {"dtype": "dict", "value": bool(ok)}
+        if not ok:
+            response["timed_out"] = False
+            return response
+        from bullet_trade.utils.env_loader import get_live_trade_config
+
+        wait_s = get_live_trade_config().get("trade_max_wait_time", 16)
+        try:
+            wait_s = float(wait_s)
+        except (TypeError, ValueError):
+            wait_s = 16.0
+        if wait_s <= 0:
+            response["timed_out"] = True
+            return response
+
+        deadline = time.monotonic() + wait_s
+        interval = 0.5
+        last_snapshot: Optional[Dict[str, Any]] = None
+        final_snapshot: Optional[Dict[str, Any]] = None
+        while time.monotonic() < deadline:
+            try:
+                status = await broker.get_order_status(order_id)
+            except Exception:
+                status = None
+            if status:
+                last_snapshot = status
+                st = str(status.get("status") or "").lower()
+                if st in ("filled", "cancelled", "canceled", "partly_canceled", "rejected"):
+                    final_snapshot = status
+                    break
+            await asyncio.sleep(interval)
+
+        snapshot = final_snapshot or last_snapshot
+        if snapshot:
+            response["status"] = snapshot.get("status")
+            response["raw_status"] = snapshot.get("raw_status")
+            response["last_snapshot"] = snapshot
+        response["timed_out"] = final_snapshot is None
+        return response
 
 
 def dataframe_to_payload(df):
