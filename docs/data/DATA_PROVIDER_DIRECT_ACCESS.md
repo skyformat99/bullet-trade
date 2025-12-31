@@ -5,13 +5,16 @@
 ## 快速使用
 
 ```python
-from bullet_trade.data.api import get_data_provider
+from bullet_trade.data.api import get_data_provider,set_data_provider
+
+#默认数据源
+ts = set_data_provider('tushare')
+print(get_security_info('000001.XSHE').display_name)
 
 # 不改变默认数据源，单独拿到 JQData 实例
 jq = get_data_provider("jqdata")
-
 # 调用特有接口（若 provider 未封装，回退到 SDK）
-is_st = jq.get_is_st("000001.XSHE")
+is_st = jq.get_extras('is_st', ['000001.XSHE', '000018.XSHE'], start_date='2013-12-01', end_date='2013-12-03')
 stocks = jq.get_index_stocks("399101.XSHE", date="2025-11-25")
 ```
 
