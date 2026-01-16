@@ -48,8 +48,8 @@ def test_price_precision_compare():
     )
 
     engine.run(
-        start_date="2024-04-01",
-        end_date="2024-04-01",
+        start_date="2024-06-03",
+        end_date="2024-06-03",
         capital_base=100000,
         frequency="daily",
         benchmark="000300.XSHG",
