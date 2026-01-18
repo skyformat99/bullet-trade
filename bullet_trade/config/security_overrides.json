@@ -26,6 +26,23 @@
     "by_code": {}
   },
 
+  "limit_rules": {
+    "_doc": "涨跌停比例规则：当数据源未返回 high_limit/low_limit 时用于兜底。ratio=涨跌停幅度（例如0.1表示±10%）",
+    "default": { "ratio": 0.1 },
+    "by_category": {
+      "stock": { "ratio": 0.1 },
+      "fund": { "ratio": 0.1 },
+      "money_market_fund": { "ratio": 0.1 }
+    },
+    "by_prefix": {
+      "300": { "ratio": 0.2 },
+      "301": { "ratio": 0.2 },
+      "688": { "ratio": 0.2 },
+      "689": { "ratio": 0.2 }
+    },
+    "by_code": {}
+  },
+
   "by_category": {
     "money_market_fund": { "tplus": 0, "slippage": 0.0, "tick_decimals": 3 },
     "fund":              { "tplus": 0, "slippage": 0.00246, "tick_decimals": 3 },

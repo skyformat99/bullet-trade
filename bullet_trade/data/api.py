@@ -4,7 +4,7 @@
 包装多数据源的函数，避免未来函数，确保回测准确性
 """
 
-from typing import Union, List, Optional, Dict, Any, Callable
+from typing import Union, List, Optional, Dict, Any, Callable, Tuple
 import importlib
 from datetime import datetime, timedelta, date as Date, time as Time
 import pandas as pd
@@ -486,6 +486,188 @@ def _candidate_security_keys(security: str) -> List[str]:
     return [security]
 
 
+def _resolve_limit_rule(security: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """解析涨跌停比例规则（优先级：by_code > by_prefix > by_category > default）。"""
+    _load_security_overrides_if_needed()
+    if not isinstance(_security_overrides, dict):
+        return {}
+
+    rules = _security_overrides.get("limit_rules") or {}
+    if not isinstance(rules, dict):
+        return {}
+
+    result: Dict[str, Any] = {}
+    default_rule = rules.get("default")
+    if isinstance(default_rule, dict):
+        result.update(default_rule)
+
+    if info is None:
+        info = get_security_info(security)
+    category = str((info or {}).get("category") or "").lower()
+    by_category = rules.get("by_category") or {}
+    if isinstance(by_category, dict) and category:
+        cat_rule = by_category.get(category)
+        if isinstance(cat_rule, dict):
+            result.update(cat_rule)
+
+    by_prefix = rules.get("by_prefix") or {}
+    if isinstance(by_prefix, dict):
+        code = security.split(".", 1)[0]
+        candidates = sorted(by_prefix.items(), key=lambda item: len(str(item[0])), reverse=True)
+        for prefix, rule in candidates:
+            if code.startswith(str(prefix)):
+                if isinstance(rule, dict):
+                    result.update(rule)
+                break
+
+    by_code = rules.get("by_code") or {}
+    if isinstance(by_code, dict):
+        for key in _candidate_security_keys(security):
+            code_rule = by_code.get(key)
+            if isinstance(code_rule, dict):
+                result.update(code_rule)
+                break
+
+    return result
+
+
+def _resolve_limit_ratio(security: str, info: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    rule = _resolve_limit_rule(security, info)
+    ratio = rule.get("ratio")
+    try:
+        ratio_value = float(ratio)
+    except Exception:
+        return None
+    if ratio_value <= 0:
+        return None
+    return ratio_value
+
+
+def _extract_close_series(df: Any, security: str) -> Optional[pd.Series]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    if "time" in df.columns and "code" in df.columns and "close" in df.columns:
+        sub = df[df["code"] == security]
+        if sub.empty:
+            sub = df
+        series = sub.set_index("time")["close"]
+        return series
+
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("close", security) in df.columns:
+            return df[("close", security)]
+        try:
+            block = df.xs("close", axis=1, level=0)
+        except Exception:
+            block = None
+        if block is not None and not block.empty:
+            if security in block.columns:
+                return block[security]
+            return block.iloc[:, 0]
+
+    if "close" in df.columns:
+        return df["close"]
+
+    return None
+
+
+def _fetch_pre_close(
+    security: str,
+    current_dt: datetime,
+    use_real_price: bool,
+    force_no_engine: bool,
+) -> Optional[float]:
+    kwargs: Dict[str, Any] = {
+        "security": security,
+        "end_date": current_dt,
+        "frequency": "daily",
+        "fields": ["close"],
+        "count": 2,
+        "fq": "pre",
+    }
+    if use_real_price:
+        pre_ref = current_dt.date() if isinstance(current_dt, datetime) else current_dt
+        kwargs.update(
+            prefer_engine=not force_no_engine,
+            pre_factor_ref_date=pre_ref,
+            force_no_engine=force_no_engine,
+        )
+
+    try:
+        df = _provider.get_price(**kwargs)
+    except Exception:
+        return None
+
+    series = _extract_close_series(df, security)
+    if series is None or series.empty:
+        return None
+
+    try:
+        series = series.dropna()
+    except Exception:
+        pass
+    if series.empty:
+        return None
+
+    idx = series.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        try:
+            series.index = pd.to_datetime(idx)
+        except Exception:
+            pass
+
+    try:
+        last_ts = series.index[-1]
+        last_date = last_ts.date() if hasattr(last_ts, "date") else None
+    except Exception:
+        last_date = None
+
+    current_date = current_dt.date() if isinstance(current_dt, datetime) else None
+    if last_date is not None and current_date is not None:
+        if last_date == current_date and len(series) >= 2:
+            value = series.iloc[-2]
+        else:
+            value = series.iloc[-1]
+    else:
+        value = series.iloc[-1]
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _apply_limit_fallback(
+    security: str,
+    current_dt: datetime,
+    last_price: float,
+    high_limit: float,
+    low_limit: float,
+    use_real_price: bool,
+    force_no_engine: bool,
+) -> Tuple[float, float]:
+    if high_limit > 0 and low_limit > 0:
+        return high_limit, low_limit
+
+    ratio = _resolve_limit_ratio(security)
+    if ratio is None:
+        return high_limit, low_limit
+
+    pre_close = _fetch_pre_close(security, current_dt, use_real_price, force_no_engine)
+    base_price = pre_close if pre_close and pre_close > 0 else (last_price if last_price > 0 else None)
+    if base_price is None:
+        return high_limit, low_limit
+
+    decimals = get_tick_decimals(security)
+    if high_limit <= 0:
+        high_limit = round(base_price * (1 + ratio), decimals)
+    if low_limit <= 0:
+        low_limit = round(base_price * (1 - ratio), decimals)
+
+    return high_limit, low_limit
+
+
 class BacktestCurrentData:
     """当前行情（回测/非 tick 路径）。延迟加载，按 (security, time) 缓存。"""
 
@@ -562,8 +744,8 @@ class BacktestCurrentData:
                         low_limit = float(row.get('low_limit', 0.0)) if pd.notna(row.get('low_limit', 0.0)) else 0.0
                         paused = bool(row.get('paused', False))
                     else:
-                        high_limit = close_price * 1.1
-                        low_limit = close_price * 0.9
+                        high_limit = 0.0
+                        low_limit = 0.0
                         paused = False
 
                 open_price = float(row['open']) if 'open' in row and pd.notna(row['open']) else None
@@ -583,6 +765,16 @@ class BacktestCurrentData:
                     open_price is not None and use_open_price_window and current_date is not None and row_date == current_date
                 )
                 last_price = open_price if should_use_open else close_price
+
+                high_limit, low_limit = _apply_limit_fallback(
+                    security,
+                    current_dt,
+                    last_price,
+                    high_limit,
+                    low_limit,
+                    use_real_price,
+                    force_no_engine,
+                )
 
                 data = SecurityUnitData(
                     security=security,
@@ -652,12 +844,27 @@ class LiveCurrentData:
                 raise
 
         if isinstance(snap, dict) and snap.get('last_price') is not None:
+            last_price = float(snap.get('last_price') or 0.0)
+            high_limit = float(snap.get('high_limit') or 0.0)
+            low_limit = float(snap.get('low_limit') or 0.0)
+            paused = bool(snap.get('paused') or False)
+            use_real_price = _get_setting('use_real_price')
+            force_no_engine = _get_setting('force_no_engine')
+            high_limit, low_limit = _apply_limit_fallback(
+                security,
+                current_dt,
+                last_price,
+                high_limit,
+                low_limit,
+                use_real_price,
+                force_no_engine,
+            )
             data = SecurityUnitData(
                 security=security,
-                last_price=float(snap.get('last_price') or 0.0),
-                high_limit=float(snap.get('high_limit') or 0.0),
-                low_limit=float(snap.get('low_limit') or 0.0),
-                paused=bool(snap.get('paused') or False),
+                last_price=last_price,
+                high_limit=high_limit,
+                low_limit=low_limit,
+                paused=paused,
             )
         else:
             if requires_live:
