@@ -273,6 +273,7 @@ class MiniQMTProvider(DataProvider):
         fill_paused: bool = True,
         pre_factor_ref_date: Optional[Union[str, datetime]] = None,
         prefer_engine: bool = False,
+        force_no_engine: bool = False,
     ) -> pd.DataFrame:
         securities = security if isinstance(security, (list, tuple)) else [security]
         frames: Dict[str, pd.DataFrame] = {}
@@ -863,10 +864,26 @@ class MiniQMTProvider(DataProvider):
             ref_dt = pd.to_datetime(pre_factor_ref_date)
         except Exception:
             ref_dt = adj_df.index[0 if default_to_start else -1]
-        if ref_dt not in raw_df.index or ref_dt not in adj_df.index:
+
+        reference_raw = None
+        reference_adj = None
+        if ref_dt in raw_df.index and ref_dt in adj_df.index:
+            reference_raw = raw_df.loc[ref_dt, "close"]
+            reference_adj = adj_df.loc[ref_dt, "close"]
+        else:
+            ref_date = ref_dt.date() if hasattr(ref_dt, "date") else None
+            if ref_date is not None and hasattr(raw_df.index, "date"):
+                raw_mask = raw_df.index.date == ref_date
+                adj_mask = adj_df.index.date == ref_date
+                if raw_mask.any() and adj_mask.any():
+                    try:
+                        reference_raw = raw_df.loc[raw_mask, "close"].iloc[-1]
+                        reference_adj = adj_df.loc[adj_mask, "close"].iloc[-1]
+                    except Exception:
+                        reference_raw = None
+                        reference_adj = None
+        if reference_raw is None or reference_adj is None:
             return adj_df
-        reference_raw = raw_df.loc[ref_dt, "close"]
-        reference_adj = adj_df.loc[ref_dt, "close"]
         if reference_adj == 0:
             return adj_df
         scale = reference_raw / reference_adj
@@ -975,16 +992,39 @@ class MiniQMTProvider(DataProvider):
         return df
 
     def get_index_stocks(self, index_symbol: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
-        kwargs = {"index_symbol": index_symbol, "date": date}
+        if date is not None:
+            logger.warning("MiniQMT 的 get_index_stocks 不支持历史日期，已忽略 date=%s，仅返回最新成分股", date)
+        # QMT 只返回最新权重，date 不参与缓存键，避免历史日期导致永久缓存
+        kwargs = {"index_symbol": index_symbol, "date": None}
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             xt = self._ensure_xtdata()
-            target_date = self._format_time(kw.get("date"), "1d")
             normalized_symbol = self._normalize_security_code(kw["index_symbol"])
-            if hasattr(xt, "get_index_stocks"):
-                data = xt.get_index_stocks(normalized_symbol, date=target_date)
+            if self.auto_download and hasattr(xt, "download_index_weight"):
+                try:
+                    xt.download_index_weight()
+                except Exception:
+                    pass
+            if hasattr(xt, "get_index_weight"):
+                data = xt.get_index_weight(normalized_symbol)
                 if data:
-                    return [self._to_jq_code(code) for code in data]
+                    if isinstance(data, dict):
+                        codes = list(data.keys())
+                    elif isinstance(data, (list, tuple, set)):
+                        codes = list(data)
+                    elif hasattr(data, "keys"):
+                        try:
+                            codes = list(data.keys())
+                        except Exception:
+                            codes = []
+                    elif hasattr(data, "index"):
+                        try:
+                            codes = list(data.index)
+                        except Exception:
+                            codes = []
+                    else:
+                        codes = []
+                    return [self._to_jq_code(code) for code in codes if code]
             return []
 
         return self._cache.cached_call("get_index_stocks", kwargs, _fetch, result_type="list_str")

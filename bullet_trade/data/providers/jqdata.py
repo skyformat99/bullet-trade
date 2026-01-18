@@ -2,6 +2,7 @@ from typing import Union, List, Optional, Dict, Any, Set, Callable, Tuple
 from datetime import datetime, date as Date
 import logging
 import os
+import json
 import pandas as pd
 import jqdatasdk as jq
 from jqdatasdk import finance, query
@@ -66,6 +67,8 @@ class JQDataProvider(DataProvider):
         self._security_info_cache: Dict[str, Dict[str, Any]] = {}
         self._fund_membership_cache: Dict[str, Set[str]] = {}
         self._price_engine_supported: Optional[bool] = None
+        self._security_overrides_loaded = False
+        self._security_overrides: Dict[str, Any] = {}
 
     @staticmethod
     def _sanitize_env_value(value: str) -> str:
@@ -169,7 +172,8 @@ class JQDataProvider(DataProvider):
                   end_date: Optional[Union[str, datetime]] = None, frequency: str = 'daily',
                   fields: Optional[List[str]] = None, skip_paused: bool = False, fq: str = 'pre',
                   count: Optional[int] = None, panel: bool = True, fill_paused: bool = True,
-                  pre_factor_ref_date: Optional[Union[str, datetime]] = None, prefer_engine: bool = False) -> pd.DataFrame:
+                  pre_factor_ref_date: Optional[Union[str, datetime]] = None, prefer_engine: bool = False,
+                  force_no_engine: bool = False) -> pd.DataFrame:
         kwargs = {
             'security': security,
             'start_date': start_date,
@@ -183,6 +187,7 @@ class JQDataProvider(DataProvider):
             'fill_paused': fill_paused,
             'pre_factor_ref_date': pre_factor_ref_date,
             'prefer_engine': prefer_engine,
+            'force_no_engine': force_no_engine,
         }
 
         def _fetch_price_engine(kw: Dict[str, Any]) -> pd.DataFrame:
@@ -219,40 +224,58 @@ class JQDataProvider(DataProvider):
                 fill_paused=kw.get('fill_paused', True),
             )
 
+        force_no_engine = bool(force_no_engine)
         # If a pre_factor_ref_date is explicitly provided for forward-adjusted data,
         # route to get_price_engine so the parameter is honored by jqdatasdk.
-        should_try_engine = (prefer_engine or pre_factor_ref_date is not None) and fq == 'pre'
+        should_try_engine = (
+            (prefer_engine or pre_factor_ref_date is not None)
+            and fq == 'pre'
+            and not force_no_engine
+        )
 
-        if should_try_engine and self._price_engine_supported is not False:
-            try:
-                result = self._cache.cached_call('get_price_engine', kwargs, _fetch_price_engine, result_type='df')
-                if self._price_engine_supported is None:
-                    self._price_engine_supported = True
-                return result
-            except Exception as exc:
-                if self._is_engine_missing_error(exc):
-                    if self._price_engine_supported is not False:
-                        logger.debug("检测到 get_price_engine 不可用，使用复权因子回退: %s", exc)
-                    self._price_engine_supported = False
-                    return self._manual_prefactor_fallback(
-                        kwargs,
-                        _fetch_price,
-                        fields,
-                        pre_factor_ref_date,
-                        fq,
-                    )
-                raise
-
-        if should_try_engine and self._price_engine_supported is False:
-            return self._manual_prefactor_fallback(
+        if force_no_engine and fq == 'pre' and pre_factor_ref_date is not None:
+            result = self._manual_prefactor_fallback(
                 kwargs,
                 _fetch_price,
                 fields,
                 pre_factor_ref_date,
                 fq,
             )
+            return self._round_price_result(result, security) if fq == 'pre' else result
 
-        return self._cache.cached_call('get_price', kwargs, _fetch_price, result_type='df')
+        if should_try_engine and self._price_engine_supported is not False:
+            try:
+                result = self._cache.cached_call('get_price_engine', kwargs, _fetch_price_engine, result_type='df')
+                if self._price_engine_supported is None:
+                    self._price_engine_supported = True
+                return self._round_price_result(result, security) if fq == 'pre' else result
+            except Exception as exc:
+                if self._is_engine_missing_error(exc):
+                    if self._price_engine_supported is not False:
+                        logger.debug("检测到 get_price_engine 不可用，使用复权因子回退: %s", exc)
+                    self._price_engine_supported = False
+                    result = self._manual_prefactor_fallback(
+                        kwargs,
+                        _fetch_price,
+                        fields,
+                        pre_factor_ref_date,
+                        fq,
+                    )
+                    return self._round_price_result(result, security) if fq == 'pre' else result
+                raise
+
+        if should_try_engine and self._price_engine_supported is False:
+            result = self._manual_prefactor_fallback(
+                kwargs,
+                _fetch_price,
+                fields,
+                pre_factor_ref_date,
+                fq,
+            )
+            return self._round_price_result(result, security) if fq == 'pre' else result
+
+        result = self._cache.cached_call('get_price', kwargs, _fetch_price, result_type='df')
+        return self._round_price_result(result, security) if fq == 'pre' else result
 
     def get_security_info(
         self,
@@ -284,6 +307,13 @@ class JQDataProvider(DataProvider):
             start_date = getattr(sec_info, 'start_date', None)
             end_date = getattr(sec_info, 'end_date', None)
             parent = getattr(sec_info, 'parent', None)
+            price_decimals = getattr(sec_info, 'price_decimals', None)
+            tick_size = None
+            if hasattr(sec_info, "get_tick_size"):
+                try:
+                    tick_size = sec_info.get_tick_size()
+                except Exception:
+                    tick_size = None
             if result_type:
                 result['type'] = result_type
             if subtype:
@@ -298,6 +328,10 @@ class JQDataProvider(DataProvider):
                 result['end_date'] = end_date
             if parent:
                 result['parent'] = parent
+            if price_decimals is not None:
+                result['price_decimals'] = price_decimals
+            if tick_size is not None:
+                result['tick_size'] = tick_size
 
         result['code'] = security
 
@@ -820,13 +854,17 @@ class JQDataProvider(DataProvider):
     ) -> pd.DataFrame:
         fallback_kwargs = dict(kwargs)
         fallback_kwargs['prefer_engine'] = False
+        fallback_kwargs['fq'] = 'pre'
         fields_with_factor, added_factor = self._prepare_fields_with_factor(requested_fields)
         fallback_kwargs['fields'] = fields_with_factor
         result = self._cache.cached_call('get_price', fallback_kwargs, fetch_fn, result_type='df')
+        result = self._deflate_prefactor_result(result)
+        factor_ref_map = self._fetch_factor_ref_map(kwargs.get("security"), pre_factor_ref_date)
         return self._apply_prefactor_adjustment(
             result,
             fq=fq,
             drop_factor=added_factor,
+            factor_ref_map=factor_ref_map,
         )
 
     def _prepare_fields_with_factor(
@@ -853,6 +891,7 @@ class JQDataProvider(DataProvider):
         data: Any,
         fq: str,
         drop_factor: bool,
+        factor_ref_map: Optional[Dict[str, float]] = None,
     ) -> Any:
         if data is None:
             return data
@@ -862,22 +901,67 @@ class JQDataProvider(DataProvider):
             working = data.copy()
         except Exception:
             working = data
-        adjusted = self._adjust_dataframe_result(working)
+        adjusted = self._adjust_dataframe_result(working, factor_ref_map)
         if drop_factor:
             adjusted = self._drop_factor_from_result(adjusted)
         return adjusted
-    def _adjust_dataframe_result(self, data: Any) -> Any:
+
+    def _deflate_prefactor_result(self, data: Any) -> Any:
+        if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+            return data
+        result_df = data.copy()
+        cols = result_df.columns
+        if isinstance(cols, pd.MultiIndex):
+            top_levels = list(cols.get_level_values(0))
+            if 'factor' not in top_levels:
+                return result_df
+            try:
+                factor_block = result_df.xs('factor', axis=1, level=0)
+            except Exception:
+                return result_df
+            numeric_block = factor_block.apply(pd.to_numeric, errors='coerce')
+            numeric_block.replace(0.0, float('nan'), inplace=True)
+            ratio_df = 1.0 / numeric_block
+            ratio_df.replace([float('inf'), float('-inf')], float('nan'), inplace=True)
+            ratio_df = ratio_df.ffill().bfill()
+            ratio_df.fillna(1.0, inplace=True)
+            for field in self._PRICE_SCALE_FIELDS:
+                if field in top_levels:
+                    try:
+                        value_block = result_df.xs(field, axis=1, level=0)
+                    except Exception:
+                        continue
+                    scaled = value_block.multiply(ratio_df, fill_value=0.0)
+                    for code in scaled.columns:
+                        result_df[(field, code)] = scaled[code]
+            return result_df
+
+        base_cols = list(result_df.columns)
+        if 'factor' not in base_cols:
+            return result_df
+        factor_series = pd.to_numeric(result_df['factor'], errors='coerce')
+        factor_series.replace(0.0, float('nan'), inplace=True)
+        ratio = 1.0 / factor_series
+        ratio.replace([float('inf'), float('-inf')], float('nan'), inplace=True)
+        ratio = ratio.ffill().bfill()
+        ratio.fillna(1.0, inplace=True)
+        for field in self._PRICE_SCALE_FIELDS:
+            if field in result_df.columns:
+                result_df[field] = result_df[field].multiply(ratio, fill_value=0.0)
+        return result_df
+
+    def _adjust_dataframe_result(self, data: Any, factor_ref_map: Optional[Dict[str, float]] = None) -> Any:
         if isinstance(data, pd.DataFrame):
-            return self._adjust_dataframe(data)
+            return self._adjust_dataframe(data, factor_ref_map)
         if hasattr(data, 'to_frame'):
             try:
                 df = data.to_frame()
             except Exception:
                 return data
-            return self._adjust_dataframe(df)
+            return self._adjust_dataframe(df, factor_ref_map)
         return data
 
-    def _adjust_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _adjust_dataframe(self, df: pd.DataFrame, factor_ref_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
         if df.empty:
             return df
         result_df = df.copy()
@@ -890,7 +974,7 @@ class JQDataProvider(DataProvider):
                 factor_block = result_df.xs('factor', axis=1, level=0)
             except Exception:
                 return result_df
-            ratio_df = self._compute_ratio_frame(factor_block)
+            ratio_df = self._compute_ratio_frame(factor_block, factor_ref_map)
             if ratio_df is None:
                 return result_df
             for field in self._PRICE_SCALE_FIELDS:
@@ -907,31 +991,51 @@ class JQDataProvider(DataProvider):
         base_cols = list(result_df.columns)
         has_factor = 'factor' in base_cols
         if has_factor and 'code' in base_cols and 'time' in base_cols:
-            return self._adjust_long_dataframe(result_df)
+            return self._adjust_long_dataframe(result_df, factor_ref_map)
         if has_factor:
-            ratio_series = self._compute_ratio_series(result_df['factor'])
+            factor_ref = None
+            if factor_ref_map:
+                factor_ref = next(iter(factor_ref_map.values()))
+            ratio_series = self._compute_ratio_series(result_df['factor'], factor_ref)
             for field in self._PRICE_SCALE_FIELDS:
                 if field in result_df.columns:
                     result_df[field] = result_df[field].multiply(ratio_series, fill_value=0.0)
             return result_df
         return result_df
 
-    def _adjust_long_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _adjust_long_dataframe(self, df: pd.DataFrame, factor_ref_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
         working = df.copy()
         if 'time' not in working.columns or 'code' not in working.columns or 'factor' not in working.columns:
             return working
-        ratio = self._compute_ratio_series(working['factor'])
-        for field in self._PRICE_SCALE_FIELDS:
-            if field in working.columns:
-                working[field] = working[field] * ratio
+        if factor_ref_map:
+            for code, factor_ref in factor_ref_map.items():
+                mask = working['code'] == code
+                if not mask.any():
+                    continue
+                ratio = self._compute_ratio_series(working.loc[mask, 'factor'], factor_ref)
+                for field in self._PRICE_SCALE_FIELDS:
+                    if field in working.columns:
+                        working.loc[mask, field] = working.loc[mask, field] * ratio
+        else:
+            ratio = self._compute_ratio_series(working['factor'], None)
+            for field in self._PRICE_SCALE_FIELDS:
+                if field in working.columns:
+                    working[field] = working[field] * ratio
         return working
 
-    def _compute_ratio_frame(self, factor_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def _compute_ratio_frame(
+        self,
+        factor_df: pd.DataFrame,
+        factor_ref_map: Optional[Dict[str, float]] = None,
+    ) -> Optional[pd.DataFrame]:
         if factor_df is None or factor_df.empty:
             return None
         ratio_columns: Dict[str, pd.Series] = {}
         for col in factor_df.columns:
-            ratio_columns[col] = self._compute_ratio_series(factor_df[col])
+            factor_ref = None
+            if factor_ref_map is not None:
+                factor_ref = factor_ref_map.get(str(col))
+            ratio_columns[col] = self._compute_ratio_series(factor_df[col], factor_ref)
         ratio_df = pd.DataFrame(ratio_columns)
         ratio_df = ratio_df.reindex(factor_df.index)
         ratio_df.replace([float('inf'), float('-inf')], float('nan'), inplace=True)
@@ -939,12 +1043,14 @@ class JQDataProvider(DataProvider):
         ratio_df.fillna(1.0, inplace=True)
         return ratio_df
 
-    def _compute_ratio_series(self, series: pd.Series) -> pd.Series:
+    def _compute_ratio_series(self, series: pd.Series, factor_ref: Optional[float]) -> pd.Series:
         if series is None or series.empty:
             return pd.Series([], index=series.index if isinstance(series, pd.Series) else None, dtype=float)
         denom = pd.to_numeric(series, errors='coerce')
         denom.replace(0.0, float('nan'), inplace=True)
-        ratio = 1.0 / denom
+        if factor_ref in (None, 0.0):
+            factor_ref = 1.0
+        ratio = denom / factor_ref
         ratio.replace([float('inf'), float('-inf')], float('nan'), inplace=True)
         ratio = ratio.ffill().bfill()
         ratio.fillna(1.0, inplace=True)
@@ -960,6 +1066,234 @@ class JQDataProvider(DataProvider):
                 return data.drop(columns=['factor'])
             return data
         return data
+
+    def _fetch_factor_ref_map(
+        self,
+        security: Union[str, List[str], None],
+        ref_date: Optional[Union[str, datetime]],
+    ) -> Dict[str, float]:
+        if not security or ref_date is None:
+            return {}
+        try:
+            ref_day = pd.to_datetime(ref_date).date()
+        except Exception:
+            return {}
+        securities = [security] if isinstance(security, str) else list(security)
+        if not securities:
+            return {}
+        kwargs = {
+            "security": securities,
+            "end_date": ref_day,
+            "frequency": "daily",
+            "fields": ["factor"],
+            "count": 1,
+            "panel": False,
+            "fq": "pre",
+        }
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            return jq.get_price(
+                security=kw["security"],
+                end_date=kw["end_date"],
+                frequency=kw["frequency"],
+                fields=kw["fields"],
+                count=kw["count"],
+                panel=kw["panel"],
+                fq=kw["fq"],
+            )
+
+        df = self._cache.cached_call("get_price_factor_ref", kwargs, _fetch, result_type="df")
+        return self._extract_factor_ref_map(df, securities)
+
+    def _extract_factor_ref_map(
+        self,
+        df: Any,
+        securities: List[str],
+    ) -> Dict[str, float]:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        ref_map: Dict[str, float] = {}
+        if "code" in df.columns and "factor" in df.columns:
+            for code, sub in df.groupby("code"):
+                if sub.empty:
+                    continue
+                val = sub.iloc[-1]["factor"]
+                try:
+                    ref_map[str(code)] = float(val)
+                except Exception:
+                    continue
+            return ref_map
+        if isinstance(df.columns, pd.MultiIndex):
+            if "factor" in df.columns.get_level_values(0):
+                try:
+                    block = df.xs("factor", axis=1, level=0)
+                except Exception:
+                    block = None
+                if block is not None and not block.empty:
+                    for code in block.columns:
+                        try:
+                            ref_map[str(code)] = float(block.iloc[-1][code])
+                        except Exception:
+                            continue
+                    return ref_map
+        if "factor" in df.columns:
+            code = securities[0] if securities else ""
+            try:
+                ref_map[str(code)] = float(df.iloc[-1]["factor"])
+            except Exception:
+                pass
+        return ref_map
+
+    def _resolve_price_decimals(self, security: str) -> int:
+        info = None
+        try:
+            info = self.get_security_info(security)
+        except Exception:
+            info = None
+        if isinstance(info, dict):
+            override_decimals = self._resolve_override_decimals(security, info)
+            if override_decimals is not None:
+                return override_decimals
+            tick_size = info.get("tick_size")
+            tick_decimals = self._decimals_from_tick_size(tick_size)
+            if tick_decimals is not None:
+                return tick_decimals
+            for key in ("price_decimals", "tick_decimals"):
+                val = info.get(key)
+                if isinstance(val, (int, float)) and val >= 0:
+                    return int(val)
+        return 2
+
+    @staticmethod
+    def _decimals_from_tick_size(tick_size: Any) -> Optional[int]:
+        try:
+            tick = float(tick_size)
+        except Exception:
+            return None
+        if tick <= 0:
+            return None
+        text = f"{tick:.10f}".rstrip("0").rstrip(".")
+        if "." not in text:
+            return 0
+        return len(text.split(".", 1)[1])
+
+    def _load_security_overrides(self) -> None:
+        if self._security_overrides_loaded:
+            return
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "config",
+            "security_overrides.json",
+        )
+        data: Dict[str, Any] = {}
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                    if isinstance(payload, dict):
+                        data = payload
+        except Exception as exc:
+            logger.debug("读取security_overrides失败: %s", exc)
+        self._security_overrides = data
+        self._security_overrides_loaded = True
+
+    @staticmethod
+    def _candidate_security_keys(security: str) -> List[str]:
+        if not security or "." not in security:
+            return [security]
+        code, suffix = security.split(".", 1)
+        suffix = suffix.upper()
+        if suffix in ("XSHG", "SH"):
+            return [security, f"{code}.XSHG", f"{code}.SH"]
+        if suffix in ("XSHE", "SZ"):
+            return [security, f"{code}.XSHE", f"{code}.SZ"]
+        if suffix in ("BJ", "BSE"):
+            return [security, f"{code}.BJ", f"{code}.BSE"]
+        return [security]
+
+    def _resolve_override_decimals(self, security: str, info: Dict[str, Any]) -> Optional[int]:
+        self._load_security_overrides()
+        overrides = self._security_overrides or {}
+        by_category = overrides.get("by_category") or {}
+        by_prefix = overrides.get("by_prefix") or {}
+        by_code = overrides.get("by_code") or {}
+
+        category = None
+        tick_decimals = None
+        if isinstance(by_code, dict):
+            for key in self._candidate_security_keys(security):
+                entry = by_code.get(key)
+                if isinstance(entry, dict):
+                    if entry.get("tick_decimals") is not None:
+                        tick_decimals = entry.get("tick_decimals")
+                    if entry.get("category"):
+                        category = entry.get("category")
+                    break
+
+        if category is None and isinstance(by_prefix, dict):
+            code = security.split(".", 1)[0]
+            for prefix, cat in by_prefix.items():
+                if code.startswith(str(prefix)):
+                    category = cat
+                    break
+
+        if category is None:
+            subtype = str(info.get("subtype") or "").lower()
+            primary = str(info.get("type") or "").lower()
+            if subtype in ("mmf", "money_market_fund"):
+                category = "money_market_fund"
+            elif primary in ("fund", "etf"):
+                category = "fund"
+            else:
+                category = "stock"
+
+        if tick_decimals is None and isinstance(by_category, dict) and category:
+            entry = by_category.get(category)
+            if isinstance(entry, dict) and entry.get("tick_decimals") is not None:
+                tick_decimals = entry.get("tick_decimals")
+
+        try:
+            if tick_decimals is not None:
+                return int(tick_decimals)
+        except Exception:
+            return None
+        return None
+
+    def _round_price_result(self, data: Any, security: Union[str, List[str]]) -> Any:
+        if not isinstance(data, pd.DataFrame):
+            return data
+        if data.empty:
+            return data
+        securities = [security] if isinstance(security, str) else list(security)
+        if not securities:
+            return data
+        decimals_map = {str(code): self._resolve_price_decimals(str(code)) for code in securities}
+        price_fields = {str(f) for f in self._PRICE_SCALE_FIELDS}
+        result_df = data.copy()
+        cols = result_df.columns
+        if isinstance(cols, pd.MultiIndex):
+            for field, code in cols:
+                if str(field) in price_fields:
+                    dec = decimals_map.get(str(code), 2)
+                    try:
+                        result_df[(field, code)] = result_df[(field, code)].round(dec)
+                    except Exception:
+                        continue
+            return result_df
+        if "code" in result_df.columns:
+            for code, dec in decimals_map.items():
+                mask = result_df["code"] == code
+                if not mask.any():
+                    continue
+                for field in price_fields:
+                    if field in result_df.columns:
+                        result_df.loc[mask, field] = result_df.loc[mask, field].round(dec)
+            return result_df
+        dec = decimals_map.get(str(securities[0]), 2)
+        for field in price_fields:
+            if field in result_df.columns:
+                result_df[field] = result_df[field].round(dec)
+        return result_df
 
     @staticmethod
     def _is_engine_missing_error(exc: Exception) -> bool:

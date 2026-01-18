@@ -5,6 +5,7 @@
 """
 
 from dataclasses import dataclass
+from datetime import date as Date
 from typing import Optional, Dict, Any, Iterable
 
 
@@ -167,6 +168,7 @@ class StrategySettings:
             'order_volume_ratio': 0.25,  # 成交量比例
             'order_match_mode': 'immediate',  # 下单撮合模式：'bar_end' 或 'immediate'
             'match_by_signal': False,  # 限价资金检查按信号价或撮合价
+            'fq_ref_date': Date.today(),  # 前复权参考日期（use_real_price=False 时使用）
         }
     
     def reset(self):
@@ -182,6 +184,7 @@ class StrategySettings:
             'order_volume_ratio': 0.25,
             'order_match_mode': 'immediate',
             'match_by_signal': False,
+            'fq_ref_date': Date.today(),
         }
 
 
@@ -299,9 +302,11 @@ def set_option(key: str, value: Any):
         key: 选项名称
             - 'use_real_price': 是否使用真实价格（动态复权）
             - 'avoid_future_data': 是否避免未来数据
+            - 'force_no_engine': 是否强制不使用数据源引擎
             - 'order_volume_ratio': 成交量比例
             - 'order_match_mode': 下单撮合模式（'bar_end'|'immediate'）
             - 'match_by_signal': 限价资金检查使用信号价(True)或撮合价(False)
+            - 'fq_ref_date': 前复权参考日期（datetime.date）
         value: 选项值
     """
     _settings.options[key] = value

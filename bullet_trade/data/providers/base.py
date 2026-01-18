@@ -33,6 +33,7 @@ class DataProvider(ABC):
         fill_paused: bool = True,
         pre_factor_ref_date: Optional[Union[str, datetime]] = None,
         prefer_engine: bool = False,
+        force_no_engine: bool = False,
     ) -> pd.DataFrame:
         pass
 

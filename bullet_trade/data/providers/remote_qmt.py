@@ -61,6 +61,7 @@ class RemoteQmtProvider(DataProvider):
         fill_paused: bool = True,
         pre_factor_ref_date: Optional[str] = None,
         prefer_engine: bool = False,
+        force_no_engine: bool = False,
     ) -> pd.DataFrame:
         payload = {
             "security": security if isinstance(security, str) else ",".join(security),

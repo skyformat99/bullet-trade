@@ -4,7 +4,8 @@
 包装多数据源的函数，避免未来函数，确保回测准确性
 """
 
-from typing import Union, List, Optional, Dict, Any, Callable
+from typing import Union, List, Optional, Dict, Any, Callable, Tuple
+import inspect
 import importlib
 from datetime import datetime, timedelta, date as Date, time as Time
 import pandas as pd
@@ -453,6 +454,7 @@ def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]
         pass
 
     # 分类默认
+    category = out.get('category')
     cat_defaults = by_category.get(category, {}) if isinstance(by_category, dict) else {}
     if isinstance(cat_defaults, dict):
         for k, v in cat_defaults.items():
@@ -484,6 +486,231 @@ def _candidate_security_keys(security: str) -> List[str]:
     if suffix in ("BJ", "BSE"):
         return [security, f"{code}.BJ", f"{code}.BSE"]
     return [security]
+
+
+def _resolve_limit_rule(security: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """解析涨跌停比例规则（优先级：by_code > by_prefix > by_category > default）。"""
+    _load_security_overrides_if_needed()
+    if not isinstance(_security_overrides, dict):
+        return {}
+
+    rules = _security_overrides.get("limit_rules") or {}
+    if not isinstance(rules, dict):
+        return {}
+
+    result: Dict[str, Any] = {}
+    default_rule = rules.get("default")
+    if isinstance(default_rule, dict):
+        result.update(default_rule)
+
+    if info is None:
+        info = get_security_info(security)
+    category = str((info or {}).get("category") or "").lower()
+    by_category = rules.get("by_category") or {}
+    if isinstance(by_category, dict) and category:
+        cat_rule = by_category.get(category)
+        if isinstance(cat_rule, dict):
+            result.update(cat_rule)
+
+    by_prefix = rules.get("by_prefix") or {}
+    if isinstance(by_prefix, dict):
+        code = security.split(".", 1)[0]
+        candidates = sorted(by_prefix.items(), key=lambda item: len(str(item[0])), reverse=True)
+        for prefix, rule in candidates:
+            if code.startswith(str(prefix)):
+                if isinstance(rule, dict):
+                    result.update(rule)
+                break
+
+    by_code = rules.get("by_code") or {}
+    if isinstance(by_code, dict):
+        for key in _candidate_security_keys(security):
+            code_rule = by_code.get(key)
+            if isinstance(code_rule, dict):
+                result.update(code_rule)
+                break
+
+    return result
+
+
+def _resolve_limit_ratio(security: str, info: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    rule = _resolve_limit_rule(security, info)
+    ratio = rule.get("ratio")
+    try:
+        ratio_value = float(ratio)
+    except Exception:
+        return None
+    if ratio_value <= 0:
+        return None
+    return ratio_value
+
+
+def _extract_close_series(df: Any, security: str) -> Optional[pd.Series]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    if "time" in df.columns and "code" in df.columns and "close" in df.columns:
+        sub = df[df["code"] == security]
+        if sub.empty:
+            sub = df
+        series = sub.set_index("time")["close"]
+        return series
+
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("close", security) in df.columns:
+            return df[("close", security)]
+        try:
+            block = df.xs("close", axis=1, level=0)
+        except Exception:
+            block = None
+        if block is not None and not block.empty:
+            if security in block.columns:
+                return block[security]
+            return block.iloc[:, 0]
+
+    if "close" in df.columns:
+        return df["close"]
+
+    return None
+
+
+def _resolve_fq_ref_date(current_dt: Union[datetime, Date, Any], use_real_price: bool) -> Optional[Date]:
+    """按聚宽语义返回前复权参考日期。"""
+    if use_real_price:
+        try:
+            if isinstance(current_dt, datetime):
+                return current_dt.date()
+            if isinstance(current_dt, Date):
+                return current_dt
+            return pd.to_datetime(current_dt).date()
+        except Exception:
+            return None
+    raw = _get_setting('fq_ref_date')
+    if raw is None:
+        return Date.today()
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, Date):
+        return raw
+    try:
+        return pd.to_datetime(raw).date()
+    except Exception:
+        return Date.today()
+
+
+def _call_provider_get_price(**kwargs) -> pd.DataFrame:
+    """兼容旧 provider：只透传其支持的参数。"""
+    provider = _provider
+    get_price = provider.get_price
+    try:
+        sig = inspect.signature(get_price)
+    except (TypeError, ValueError):
+        return get_price(**kwargs)
+
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return get_price(**kwargs)
+
+    allowed = set(sig.parameters.keys())
+    allowed.discard("self")
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_price(**filtered)
+
+
+def _fetch_pre_close(
+    security: str,
+    current_dt: datetime,
+    use_real_price: bool,
+    force_no_engine: bool,
+) -> Optional[float]:
+    kwargs: Dict[str, Any] = {
+        "security": security,
+        "end_date": current_dt,
+        "frequency": "daily",
+        "fields": ["close"],
+        "count": 2,
+        "fq": "pre",
+    }
+    pre_ref = _resolve_fq_ref_date(current_dt, use_real_price)
+    if pre_ref is not None:
+        kwargs.update(
+            prefer_engine=not force_no_engine,
+            pre_factor_ref_date=pre_ref,
+            force_no_engine=force_no_engine,
+        )
+
+    try:
+        df = _call_provider_get_price(**kwargs)
+    except Exception:
+        return None
+
+    series = _extract_close_series(df, security)
+    if series is None or series.empty:
+        return None
+
+    try:
+        series = series.dropna()
+    except Exception:
+        pass
+    if series.empty:
+        return None
+
+    idx = series.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        try:
+            series.index = pd.to_datetime(idx)
+        except Exception:
+            pass
+
+    try:
+        last_ts = series.index[-1]
+        last_date = last_ts.date() if hasattr(last_ts, "date") else None
+    except Exception:
+        last_date = None
+
+    current_date = current_dt.date() if isinstance(current_dt, datetime) else None
+    if last_date is not None and current_date is not None:
+        if last_date == current_date and len(series) >= 2:
+            value = series.iloc[-2]
+        else:
+            value = series.iloc[-1]
+    else:
+        value = series.iloc[-1]
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _apply_limit_fallback(
+    security: str,
+    current_dt: datetime,
+    last_price: float,
+    high_limit: float,
+    low_limit: float,
+    use_real_price: bool,
+    force_no_engine: bool,
+) -> Tuple[float, float]:
+    if high_limit > 0 and low_limit > 0:
+        return high_limit, low_limit
+
+    ratio = _resolve_limit_ratio(security)
+    if ratio is None:
+        return high_limit, low_limit
+
+    pre_close = _fetch_pre_close(security, current_dt, use_real_price, force_no_engine)
+    base_price = pre_close if pre_close and pre_close > 0 else (last_price if last_price > 0 else None)
+    if base_price is None:
+        return high_limit, low_limit
+
+    decimals = get_tick_decimals(security)
+    if high_limit <= 0:
+        high_limit = round(base_price * (1 + ratio), decimals)
+    if low_limit <= 0:
+        low_limit = round(base_price * (1 - ratio), decimals)
+
+    return high_limit, low_limit
 
 
 class BacktestCurrentData:
@@ -521,6 +748,7 @@ class BacktestCurrentData:
             current_date = win["current_date"]
 
             use_real_price = _get_setting('use_real_price')
+            force_no_engine = _get_setting('force_no_engine')
             fields = ['open', 'close', 'high_limit', 'low_limit', 'paused']
 
             def _build_fetch_kwargs(freq_text: str) -> Dict[str, Any]:
@@ -532,15 +760,19 @@ class BacktestCurrentData:
                     count=1,
                     fq='pre',
                 )
-                if use_real_price:
-                    pre_ref = current_date or current_dt
-                    kw.update(prefer_engine=True, pre_factor_ref_date=pre_ref)
+                pre_ref = _resolve_fq_ref_date(current_date or current_dt, use_real_price)
+                if pre_ref is not None:
+                    kw.update(
+                        prefer_engine=not force_no_engine,
+                        pre_factor_ref_date=pre_ref,
+                        force_no_engine=force_no_engine,
+                    )
                 return kw
 
             if use_minute:
-                df = _provider.get_price(**_build_fetch_kwargs('minute'))
+                df = _call_provider_get_price(**_build_fetch_kwargs('minute'))
             else:
-                df = _provider.get_price(**_build_fetch_kwargs('daily'))
+                df = _call_provider_get_price(**_build_fetch_kwargs('daily'))
 
             if not df.empty:
                 if 'time' in df.columns and 'code' in df.columns:
@@ -557,8 +789,8 @@ class BacktestCurrentData:
                         low_limit = float(row.get('low_limit', 0.0)) if pd.notna(row.get('low_limit', 0.0)) else 0.0
                         paused = bool(row.get('paused', False))
                     else:
-                        high_limit = close_price * 1.1
-                        low_limit = close_price * 0.9
+                        high_limit = 0.0
+                        low_limit = 0.0
                         paused = False
 
                 open_price = float(row['open']) if 'open' in row and pd.notna(row['open']) else None
@@ -578,6 +810,16 @@ class BacktestCurrentData:
                     open_price is not None and use_open_price_window and current_date is not None and row_date == current_date
                 )
                 last_price = open_price if should_use_open else close_price
+
+                high_limit, low_limit = _apply_limit_fallback(
+                    security,
+                    current_dt,
+                    last_price,
+                    high_limit,
+                    low_limit,
+                    use_real_price,
+                    force_no_engine,
+                )
 
                 data = SecurityUnitData(
                     security=security,
@@ -647,12 +889,27 @@ class LiveCurrentData:
                 raise
 
         if isinstance(snap, dict) and snap.get('last_price') is not None:
+            last_price = float(snap.get('last_price') or 0.0)
+            high_limit = float(snap.get('high_limit') or 0.0)
+            low_limit = float(snap.get('low_limit') or 0.0)
+            paused = bool(snap.get('paused') or False)
+            use_real_price = _get_setting('use_real_price')
+            force_no_engine = _get_setting('force_no_engine')
+            high_limit, low_limit = _apply_limit_fallback(
+                security,
+                current_dt,
+                last_price,
+                high_limit,
+                low_limit,
+                use_real_price,
+                force_no_engine,
+            )
             data = SecurityUnitData(
                 security=security,
-                last_price=float(snap.get('last_price') or 0.0),
-                high_limit=float(snap.get('high_limit') or 0.0),
-                low_limit=float(snap.get('low_limit') or 0.0),
-                paused=bool(snap.get('paused') or False),
+                last_price=last_price,
+                high_limit=high_limit,
+                low_limit=low_limit,
+                paused=paused,
             )
         else:
             if requires_live:
@@ -688,7 +945,8 @@ def _get_setting(key: str, default: Any = False) -> Any:
 
 
 def _should_avoid_future() -> bool:
-    return bool(_current_context and _get_setting('avoid_future_data'))
+    # 仅回测上下文（非 live）需要限制未来数据，研究环境无上下文时不处理
+    return bool(_current_context and not _is_live_mode() and _get_setting('avoid_future_data'))
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
@@ -993,9 +1251,11 @@ def get_price(
             UserWarning
         )
     
+    force_no_engine = _get_setting('force_no_engine')
+
     if not _current_context:
         # 没有回测上下文，直接调用原始API
-        return _provider.get_price(
+        return _call_provider_get_price(
             security=security,
             start_date=start_date,
             end_date=end_date,
@@ -1005,7 +1265,8 @@ def get_price(
             fq=fq,
             count=count,
             panel=panel,
-            fill_paused=fill_paused
+            fill_paused=fill_paused,
+            force_no_engine=force_no_engine,
         )
     
     avoid_future = _get_setting('avoid_future_data')
@@ -1081,10 +1342,12 @@ def get_price(
                 log.warning(f"无法转换 current_dt 为 date 类型: {current_dt}, 使用今天日期")
                 pre_factor_ref_date = Date.today()
         
+        raw_df = None
+        final = None
         try:
             # 真实价格模式优先使用提供者内部引擎支持
             #log.debug(f"调用 provider.get_price(prefer_engine=True): security={security}, fields={fields}")
-            result = _provider.get_price(
+            result = _call_provider_get_price(
                 security=security,
                 start_date=start_date,
                 end_date=end_date,
@@ -1095,25 +1358,33 @@ def get_price(
                 count=count,
                 panel=panel,
                 fill_paused=fill_paused,
-                prefer_engine=True,
-                pre_factor_ref_date=pre_factor_ref_date
+                prefer_engine=not force_no_engine,
+                pre_factor_ref_date=pre_factor_ref_date,
+                force_no_engine=force_no_engine,
             )
             #log.debug(f"provider.get_price 返回: {type(result)}, {result.shape if hasattr(result, 'shape') else 'No shape'}")
             # 如果 panel=False 且返回的是长表格式（包含 time 和 code 列），直接返回，不进行转换
             # 这样可以保持与聚宽官方一致的行为，支持 df.groupby('code') 等操作
             # 注意：必须在 _coerce_price_result_to_dataframe 之前检查，否则会被转换成宽表
             if not panel and isinstance(result, pd.DataFrame) and 'time' in result.columns and 'code' in result.columns:
-                return result
-            df = _coerce_price_result_to_dataframe(result)
-            return _make_compatible_dataframe(df, fields)
-            
+                raw_df = result
+                final = result
+            else:
+                raw_df = _coerce_price_result_to_dataframe(result)
+                final = _make_compatible_dataframe(raw_df, fields)
         except Exception as e:
             _raise_if_not_implemented(e)
             log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
+            final = None
+        if final is not None:
+            _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
+            return final
     
     # 标准模式或真实价格模式失败时的回退策略
+    raw_df = None
+    final = None
     try:
-        df = _provider.get_price(
+        df = _call_provider_get_price(
             security=security,
             start_date=start_date,
             end_date=end_date,
@@ -1123,8 +1394,10 @@ def get_price(
             fq=fq,
             count=count,
             panel=panel,
-            fill_paused=fill_paused
+            fill_paused=fill_paused,
+            force_no_engine=force_no_engine,
         )
+        raw_df = df if isinstance(df, pd.DataFrame) else None
         
         # 调试日志：查看返回的数据格式
         log.debug(f"get_price 返回: panel={panel}, type={type(df)}, "
@@ -1134,15 +1407,17 @@ def get_price(
         # 如果 panel=False 且返回的是长表格式（包含 time 和 code 列），直接返回，不进行转换
         # 这样可以保持与聚宽官方一致的行为，支持 df.groupby('code') 等操作
         if not panel and isinstance(df, pd.DataFrame) and 'time' in df.columns and 'code' in df.columns:
-            return df
-        
-        # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
-        return _make_compatible_dataframe(df, fields)
+            final = df
+        else:
+            # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
+            final = _make_compatible_dataframe(df, fields)
         
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
         return pd.DataFrame()
+    _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
+    return final if final is not None else pd.DataFrame()
 
 
 
@@ -1271,6 +1546,47 @@ def _check_intraday_future_data(current_dt: datetime, fields: List[str], end_dat
     # 盘后（收盘后）- 可以获取所有数据
     else:
         pass
+
+
+def _raise_if_empty_minute_data(
+    avoid_future: bool,
+    frequency: str,
+    result: Any,
+    security: Union[str, List[str]],
+    end_date: Optional[datetime],
+) -> None:
+    if not avoid_future or not frequency or "m" not in frequency:
+        return
+    if _is_live_mode() or not _current_context:
+        return
+    if end_date is None:
+        return
+    if end_date.time() < Time(9, 30):
+        return
+    if not isinstance(result, pd.DataFrame) or not result.empty:
+        return
+    try:
+        trade_days = _provider.get_trade_days(end_date=end_date.date(), count=1)
+    except Exception:
+        trade_days = []
+    if not trade_days:
+        return
+    try:
+        last_day = pd.to_datetime(trade_days[-1]).date()
+    except Exception:
+        return
+    if last_day != end_date.date():
+        return
+    provider_name = getattr(_provider, "name", "") or "unknown"
+    provider_note = ""
+    if "qmt" in provider_name.lower():
+        provider_note = "，miniQMT 免费版可能仅有近一年数据"
+    message = (
+        "分钟数据为空，数据源未返回数据，可能未下载或超出可用范围"
+        f"{provider_note}，provider={provider_name}, security={security}, end_date={end_date}"
+    )
+    log.error(message)
+    raise UserError(message)
 
 
 def attribute_history(
