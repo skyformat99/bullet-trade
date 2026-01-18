@@ -299,6 +299,7 @@ def set_option(key: str, value: Any):
         key: 选项名称
             - 'use_real_price': 是否使用真实价格（动态复权）
             - 'avoid_future_data': 是否避免未来数据
+            - 'force_no_engine': 是否强制不使用数据源引擎
             - 'order_volume_ratio': 成交量比例
             - 'order_match_mode': 下单撮合模式（'bar_end'|'immediate'）
             - 'match_by_signal': 限价资金检查使用信号价(True)或撮合价(False)

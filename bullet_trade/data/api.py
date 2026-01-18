@@ -521,6 +521,7 @@ class BacktestCurrentData:
             current_date = win["current_date"]
 
             use_real_price = _get_setting('use_real_price')
+            force_no_engine = _get_setting('force_no_engine')
             fields = ['open', 'close', 'high_limit', 'low_limit', 'paused']
 
             def _build_fetch_kwargs(freq_text: str) -> Dict[str, Any]:
@@ -534,7 +535,11 @@ class BacktestCurrentData:
                 )
                 if use_real_price:
                     pre_ref = current_date or current_dt
-                    kw.update(prefer_engine=True, pre_factor_ref_date=pre_ref)
+                    kw.update(
+                        prefer_engine=not force_no_engine,
+                        pre_factor_ref_date=pre_ref,
+                        force_no_engine=force_no_engine,
+                    )
                 return kw
 
             if use_minute:
@@ -993,6 +998,8 @@ def get_price(
             UserWarning
         )
     
+    force_no_engine = _get_setting('force_no_engine')
+
     if not _current_context:
         # 没有回测上下文，直接调用原始API
         return _provider.get_price(
@@ -1005,7 +1012,8 @@ def get_price(
             fq=fq,
             count=count,
             panel=panel,
-            fill_paused=fill_paused
+            fill_paused=fill_paused,
+            force_no_engine=force_no_engine,
         )
     
     avoid_future = _get_setting('avoid_future_data')
@@ -1095,8 +1103,9 @@ def get_price(
                 count=count,
                 panel=panel,
                 fill_paused=fill_paused,
-                prefer_engine=True,
-                pre_factor_ref_date=pre_factor_ref_date
+                prefer_engine=not force_no_engine,
+                pre_factor_ref_date=pre_factor_ref_date,
+                force_no_engine=force_no_engine,
             )
             #log.debug(f"provider.get_price 返回: {type(result)}, {result.shape if hasattr(result, 'shape') else 'No shape'}")
             # 如果 panel=False 且返回的是长表格式（包含 time 和 code 列），直接返回，不进行转换
@@ -1123,7 +1132,8 @@ def get_price(
             fq=fq,
             count=count,
             panel=panel,
-            fill_paused=fill_paused
+            fill_paused=fill_paused,
+            force_no_engine=force_no_engine,
         )
         
         # 调试日志：查看返回的数据格式

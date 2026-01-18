@@ -31,6 +31,7 @@ def _init_results():
     }
     g._minute_checked = False
     g._pre_checked = False
+    g._factor_checked = False
 
 
 def _record_error(message):
@@ -99,9 +100,91 @@ def _extract_close(df):
         return None
 
 
+def _extract_field(df, field, code=None):
+    if df is None:
+        return None
+    try:
+        if df.empty:
+            return None
+    except Exception:
+        pass
+
+    try:
+        if isinstance(df, pd.Series):
+            value = df.get(field)
+            if pd.isna(value):
+                return None
+            return float(value)
+    except Exception:
+        pass
+
+    try:
+        if isinstance(df, pd.DataFrame):
+            if isinstance(df.columns, pd.MultiIndex):
+                if code is not None:
+                    if (field, code) in df.columns:
+                        value = df[(field, code)].iloc[-1]
+                        return float(value) if pd.notna(value) else None
+                    if (code, field) in df.columns:
+                        value = df[(code, field)].iloc[-1]
+                        return float(value) if pd.notna(value) else None
+                try:
+                    block = df.xs(field, axis=1, level=0)
+                except Exception:
+                    try:
+                        block = df.xs(field, axis=1, level=1)
+                    except Exception:
+                        block = None
+                if block is not None and not block.empty:
+                    if code is not None and code in block.columns:
+                        value = block[code].iloc[-1]
+                    else:
+                        value = block.iloc[-1][0]
+                    return float(value) if pd.notna(value) else None
+
+            if "code" in df.columns and "time" in df.columns and field in df.columns:
+                if code is not None:
+                    sub = df[df["code"] == code]
+                    if sub.empty:
+                        return None
+                    value = sub.iloc[-1][field]
+                else:
+                    value = df.iloc[-1][field]
+                return float(value) if pd.notna(value) else None
+
+            if field in df.columns:
+                value = df.iloc[-1][field]
+                return float(value) if pd.notna(value) else None
+    except Exception:
+        return None
+
+    return None
+
+
+def _describe_df(df):
+    if df is None:
+        return "None"
+    if not isinstance(df, pd.DataFrame):
+        return f"type={type(df)}"
+    try:
+        columns = list(df.columns)
+    except Exception:
+        columns = "unknown"
+    try:
+        index = df.index
+        if isinstance(index, pd.MultiIndex):
+            index_names = list(index.names)
+        else:
+            index_names = index.name
+    except Exception:
+        index_names = "unknown"
+    return f"shape={df.shape}, cols={columns}, index={index_names}"
+
+
 def initialize(context):
     set_option("avoid_future_data", True)
     set_option("use_real_price", True)
+    set_option("force_no_engine", True)
     set_benchmark("000300.XSHG")
 
     _maybe_set_data_provider()
@@ -195,5 +278,66 @@ def check_pre_close(context):
             decimals,
             context.current_dt.date(),
         )
+        _log_factor_probe(context)
     except Exception as exc:
         _record_error(f"前复权行情失败 {STOCK_CODE}: {exc}")
+
+
+def _log_factor_probe(context):
+    if getattr(g, "_factor_checked", False):
+        return
+    g._factor_checked = True
+
+    try:
+        df_raw = get_price(
+            security=STOCK_CODE,
+            end_date=TARGET_DATE,
+            frequency="daily",
+            fields=["close", "factor"],
+            count=1,
+            fq=None,
+        )
+        raw_close = _extract_field(df_raw, "close", STOCK_CODE)
+        raw_factor = _extract_field(df_raw, "factor", STOCK_CODE)
+        log.info(
+            "[精度对比][因子] %s 目标日=%s close=%s factor=%s df=%s",
+            STOCK_CODE,
+            TARGET_DATE,
+            raw_close,
+            raw_factor,
+            _describe_df(df_raw),
+        )
+    except Exception as exc:
+        log.warning("[精度对比][因子] 目标日因子获取失败: %s", exc)
+        raw_close = None
+        raw_factor = None
+
+    try:
+        ref_dt = context.current_dt
+        df_ref = get_price(
+            security=STOCK_CODE,
+            end_date=ref_dt,
+            frequency="daily",
+            fields=["factor"],
+            count=1,
+            fq=None,
+        )
+        ref_factor = _extract_field(df_ref, "factor", STOCK_CODE)
+        log.info(
+            "[精度对比][因子] %s 参考日=%s factor=%s df=%s",
+            STOCK_CODE,
+            ref_dt.date(),
+            ref_factor,
+            _describe_df(df_ref),
+        )
+        if raw_close is not None and raw_factor is not None and ref_factor:
+            ratio = raw_factor / ref_factor
+            inferred = raw_close * ratio
+            log.info(
+                "[精度对比][因子] %s 推算前复权 close=%.6f ratio=%.6f",
+                STOCK_CODE,
+                inferred,
+                ratio,
+            )
+    except Exception as exc:
+        log.warning("[精度对比][因子] 参考日因子获取失败: %s", exc)

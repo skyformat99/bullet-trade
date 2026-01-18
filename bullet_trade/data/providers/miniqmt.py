@@ -273,6 +273,7 @@ class MiniQMTProvider(DataProvider):
         fill_paused: bool = True,
         pre_factor_ref_date: Optional[Union[str, datetime]] = None,
         prefer_engine: bool = False,
+        force_no_engine: bool = False,
     ) -> pd.DataFrame:
         securities = security if isinstance(security, (list, tuple)) else [security]
         frames: Dict[str, pd.DataFrame] = {}
