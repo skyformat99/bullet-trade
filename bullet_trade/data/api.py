@@ -5,6 +5,7 @@
 """
 
 from typing import Union, List, Optional, Dict, Any, Callable, Tuple
+import inspect
 import importlib
 from datetime import datetime, timedelta, date as Date, time as Time
 import pandas as pd
@@ -597,6 +598,25 @@ def _resolve_fq_ref_date(current_dt: Union[datetime, Date, Any], use_real_price:
         return Date.today()
 
 
+def _call_provider_get_price(**kwargs) -> pd.DataFrame:
+    """兼容旧 provider：只透传其支持的参数。"""
+    provider = _provider
+    get_price = provider.get_price
+    try:
+        sig = inspect.signature(get_price)
+    except (TypeError, ValueError):
+        return get_price(**kwargs)
+
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return get_price(**kwargs)
+
+    allowed = set(sig.parameters.keys())
+    allowed.discard("self")
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_price(**filtered)
+
+
 def _fetch_pre_close(
     security: str,
     current_dt: datetime,
@@ -620,7 +640,7 @@ def _fetch_pre_close(
         )
 
     try:
-        df = _provider.get_price(**kwargs)
+        df = _call_provider_get_price(**kwargs)
     except Exception:
         return None
 
@@ -750,9 +770,9 @@ class BacktestCurrentData:
                 return kw
 
             if use_minute:
-                df = _provider.get_price(**_build_fetch_kwargs('minute'))
+                df = _call_provider_get_price(**_build_fetch_kwargs('minute'))
             else:
-                df = _provider.get_price(**_build_fetch_kwargs('daily'))
+                df = _call_provider_get_price(**_build_fetch_kwargs('daily'))
 
             if not df.empty:
                 if 'time' in df.columns and 'code' in df.columns:
@@ -1235,7 +1255,7 @@ def get_price(
 
     if not _current_context:
         # 没有回测上下文，直接调用原始API
-        return _provider.get_price(
+        return _call_provider_get_price(
             security=security,
             start_date=start_date,
             end_date=end_date,
@@ -1327,7 +1347,7 @@ def get_price(
         try:
             # 真实价格模式优先使用提供者内部引擎支持
             #log.debug(f"调用 provider.get_price(prefer_engine=True): security={security}, fields={fields}")
-            result = _provider.get_price(
+            result = _call_provider_get_price(
                 security=security,
                 start_date=start_date,
                 end_date=end_date,
@@ -1364,7 +1384,7 @@ def get_price(
     raw_df = None
     final = None
     try:
-        df = _provider.get_price(
+        df = _call_provider_get_price(
             security=security,
             start_date=start_date,
             end_date=end_date,

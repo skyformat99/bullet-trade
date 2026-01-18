@@ -1456,7 +1456,7 @@ class LiveEngine:
         snapshot: Dict[str, Any] = {}
         settings = get_settings()
         snapshot['benchmark'] = settings.benchmark
-        options = dict(settings.options or {})
+        options = self._serialize_options(settings.options or {})
         if isinstance(options.get('market_period'), (list, tuple)):
             options['market_period'] = self._serialize_market_periods(options['market_period'])
         snapshot['options'] = options
@@ -1503,6 +1503,19 @@ class LiveEngine:
         if sl_map_snapshot:
             snapshot['slippage_map'] = sl_map_snapshot
         return snapshot
+
+    @staticmethod
+    def _serialize_options(options: Dict[str, Any]) -> Dict[str, Any]:
+        def _normalize(value: Any) -> Any:
+            if isinstance(value, (datetime, date, Time)):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {k: _normalize(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [_normalize(v) for v in value]
+            return value
+
+        return {key: _normalize(value) for key, value in dict(options).items()}
 
     @staticmethod
     def _serialize_slippage_config(config: Any) -> Optional[Dict[str, Any]]:
