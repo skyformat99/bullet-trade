@@ -110,7 +110,7 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 - `RUNTIME_DIR`
 - `QMT_ACCOUNT_TYPE`
 - `QMT_SESSION_ID`
-- 风控相关参数
+- 风控相关参数，例如 `MAX_ORDER_VALUE`、`MIN_BUY_ORDER_VALUE`
 
 ## 7. 常见问题
 
